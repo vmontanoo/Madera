@@ -1,0 +1,16 @@
+{
+  "name": "madera-local",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Réplica local de un diseñador 2D/3D de muebles modulares con módulos anidados y cutlist con precios",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node --watch server/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "three": "^0.170.0"
+  }
+}
