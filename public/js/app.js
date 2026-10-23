@@ -62,8 +62,17 @@ function handleLocalApi(method, url, body) {
   }
   if (method === 'POST' && (path === '/api/auth/register' || path === '/api/register')) {
     const email = String(body?.email || '').trim().toLowerCase();
-    const name = String(body?.name || 'Usuario').trim();
+    const name = String(body?.name || '').trim();
     const password = String(body?.password || '');
+    if (name.length < 2 || name.length > 100) {
+      throw Object.assign(new Error('El nombre debe tener entre 2 y 100 caracteres'), { status: 400 });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw Object.assign(new Error('Formato de email inválido'), { status: 400 });
+    }
+    if (password.length < 6 || password.length > 128) {
+      throw Object.assign(new Error('La contraseña debe tener entre 6 y 128 caracteres'), { status: 400 });
+    }
     if (store.users.some((u) => u.email === email)) {
       throw Object.assign(new Error('Ese email ya está registrado'), { status: 409 });
     }
@@ -77,13 +86,17 @@ function handleLocalApi(method, url, body) {
   if (method === 'POST' && (path === '/api/auth/login' || path === '/api/login')) {
     const email = String(body?.email || '').trim().toLowerCase();
     const password = String(body?.password || '');
-    let u = store.users.find((x) => x.email === email);
+    if (!email || !password) {
+      throw Object.assign(new Error('Email y contraseña requeridos'), { status: 400 });
+    }
+    const u = store.users.find((x) => x.email === email);
     if (!u) {
-      // On first static login, allow creating or signing in smoothly
-      u = { id: nextId(), name: email.split('@')[0] || 'Usuario', email, password, provider: 'local', avatar_url: null, created_at: Date.now() };
-      store.users.push(u);
-      saveLocalStore(store);
-    } else if (u.password && u.password !== password) {
+      throw Object.assign(new Error('Credenciales incorrectas. Si no tienes cuenta, regístrate primero en "Crear cuenta".'), { status: 401 });
+    }
+    if (u.provider === 'google' && !u.password) {
+      throw Object.assign(new Error('Esta cuenta fue creada con Google Sign-In. Usa el botón "Iniciar sesión con Google".'), { status: 401 });
+    }
+    if (u.password !== password) {
       throw Object.assign(new Error('Credenciales incorrectas'), { status: 401 });
     }
     const token = `local-token-${u.id}`;
@@ -486,27 +499,106 @@ function authView() {
   // Clear errors on typing
   form.addEventListener('input', () => showErr(''));
 
-  // Google OAuth button redirect (with static-host fallback)
+  // Google OAuth button redirect (with interactive account chooser on static hosts)
   document.getElementById('btnGoogle').onclick = () => {
     if (staticBackendFallback) {
       const store = loadLocalStore();
-      let u = store.users.find((x) => x.email === 'ana.garcia@gmail.com');
-      if (!u) {
-        store.nextId = (store.nextId || 1) + 1;
-        u = {
-          id: store.nextId,
-          name: 'Ana García',
-          email: 'ana.garcia@gmail.com',
-          provider: 'google',
-          avatar_url: null,
-          created_at: Date.now(),
-        };
-        store.users.push(u);
+      const googleAccounts = store.users.filter((u) => u.provider === 'google' || u.email.endsWith('@gmail.com'));
+      const bg = document.createElement('div');
+      bg.className = 'modal-bg';
+      const existingHtml = googleAccounts.length
+        ? `<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+            <span class="muted" style="font-size:12px">Cuentas guardadas en este navegador:</span>
+            ${googleAccounts
+              .map(
+                (acc) => `
+              <button type="button" class="btn-action" data-g-email="${esc(acc.email)}" style="display:flex;align-items:center;gap:12px;padding:10px 12px;text-align:left;justify-content:flex-start">
+                ${renderUserAvatar(acc, 32)}
+                <div style="display:flex;flex-direction:column;overflow:hidden">
+                  <strong style="font-size:13px;color:#eee">${esc(acc.name)}</strong>
+                  <span class="muted" style="font-size:12px">${esc(acc.email)}</span>
+                </div>
+              </button>`
+              )
+              .join('')}
+          </div>`
+        : '';
+
+      bg.innerHTML = `<div class="modal" style="max-width:410px">
+        <div class="row" style="align-items:center;gap:10px;margin-bottom:6px">
+          <svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+          </svg>
+          <b style="flex:1;font-size:16px">Elegir una cuenta de Google</b>
+          <button id="closeGModal" type="button">✕</button>
+        </div>
+        <span class="muted" style="display:block;margin-bottom:12px">para continuar en <b>Dajusca.app</b></span>
+        ${existingHtml}
+        <form id="gCustomForm" style="display:flex;flex-direction:column;gap:10px">
+          <span class="muted" style="font-size:12px">${googleAccounts.length ? 'O usar otra cuenta de Google:' : 'Ingresa tu cuenta de Google:'}</span>
+          <input id="gName" class="form-input" type="text" placeholder="Tu nombre (ej. Vicente Montaño)" required minlength="2">
+          <input id="gEmail" class="form-input" type="email" placeholder="tu.correo@gmail.com" required>
+          <div id="gModalErr" class="auth-err" style="display:none;padding:8px 10px;font-size:12px"></div>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:4px">
+            <button type="button" id="cancelGModal">Cancelar</button>
+            <button type="submit" class="primary">Continuar con Google</button>
+          </div>
+        </form>
+      </div>`;
+      document.body.appendChild(bg);
+
+      const signInWithGoogleData = (name, email) => {
+        const cleanEmail = String(email || '').trim().toLowerCase();
+        const cleanName = String(name || '').trim() || cleanEmail.split('@')[0];
+        let u = store.users.find((x) => x.email === cleanEmail);
+        if (!u) {
+          store.nextId = (store.nextId || 1) + 1;
+          u = {
+            id: store.nextId,
+            name: cleanName,
+            email: cleanEmail,
+            provider: 'google',
+            avatar_url: null,
+            created_at: Date.now(),
+          };
+          store.users.push(u);
+        } else {
+          u.name = cleanName || u.name;
+        }
         saveLocalStore(store);
-      }
-      localStorage.setItem('madera_token', `local-token-${u.id}`);
-      currentUser = u;
-      route();
+        localStorage.setItem('madera_token', `local-token-${u.id}`);
+        currentUser = u;
+        bg.remove();
+        route();
+      };
+
+      bg.querySelector('#closeGModal').onclick = bg.querySelector('#cancelGModal').onclick = () => bg.remove();
+      bg.querySelectorAll('[data-g-email]').forEach((btn) => {
+        btn.onclick = () => {
+          const acc = store.users.find((x) => x.email === btn.dataset.gEmail);
+          if (acc) signInWithGoogleData(acc.name, acc.email);
+        };
+      });
+      bg.querySelector('#gCustomForm').onsubmit = (ev) => {
+        ev.preventDefault();
+        const gName = bg.querySelector('#gName').value.trim();
+        const gEmail = bg.querySelector('#gEmail').value.trim().toLowerCase();
+        const gErr = bg.querySelector('#gModalErr');
+        if (gName.length < 2) {
+          gErr.textContent = 'Ingresa tu nombre (mínimo 2 caracteres).';
+          gErr.style.display = 'flex';
+          return;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(gEmail)) {
+          gErr.textContent = 'Ingresa un correo electrónico válido.';
+          gErr.style.display = 'flex';
+          return;
+        }
+        signInWithGoogleData(gName, gEmail);
+      };
       return;
     }
     location.href = '/api/auth/google';
