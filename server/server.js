@@ -10,7 +10,8 @@ import { computeLayout, DEFAULTS } from '../public/js/layout.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
-const PORT = Number(process.env.APP_PORT) || 3000;
+const IS_AISTUDIO_SANDBOX = fs.existsSync('/app/control-plane-api');
+const PORT = Number(process.env.APP_PORT) || (IS_AISTUDIO_SANDBOX ? 3000 : Number(process.env.PORT) || 3000);
 
 // ============================================================================
 // 1. DATABASE INITIALIZATION & AUTO-MIGRATIONS
@@ -372,8 +373,8 @@ function upsertGoogleUser({ email, name, google_id, avatar_url }) {
 // ============================================================================
 const app = express();
 app.use(express.json({ limit: '5mb' }));
-app.use('/vendor/three', express.static(path.join(root, 'node_modules', 'three')));
 app.use(express.static(path.join(root, 'public')));
+app.use('/vendor/three', express.static(path.join(root, 'node_modules', 'three')));
 
 // ----------------------------------------------------------------------------
 // 4.1 Registration Handlers

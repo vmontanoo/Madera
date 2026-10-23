@@ -18,17 +18,235 @@ export const FRONT_OPTIONS = [
 const $app = typeof document !== 'undefined' ? document.getElementById('app') : null;
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+let staticBackendFallback = typeof sessionStorage !== 'undefined' && sessionStorage.getItem('dajusca_static_mode') === '1';
+
+function loadLocalStore() {
+  try {
+    const raw = localStorage.getItem('dajusca_local_db');
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { users: [], projects: [], clients: [], quotes: [], nextId: 1 };
+}
+
+function saveLocalStore(store) {
+  try {
+    localStorage.setItem('dajusca_local_db', JSON.stringify(store));
+  } catch {}
+}
+
+function getLocalUser(store) {
+  const token = localStorage.getItem('madera_token') || '';
+  const m = token.match(/^local-token-(\d+)$/);
+  if (!m) return null;
+  const uidNum = Number(m[1]);
+  return store.users.find((u) => u.id === uidNum) || null;
+}
+
+function handleLocalApi(method, url, body) {
+  const store = loadLocalStore();
+  const nextId = () => {
+    store.nextId = (store.nextId || 1) + 1;
+    return store.nextId;
+  };
+  const path = url.split('?')[0];
+  const user = getLocalUser(store);
+
+  // Auth routes
+  if (method === 'GET' && (path === '/api/auth/me' || path === '/api/me')) {
+    if (!user) throw Object.assign(new Error('No autenticado'), { status: 401 });
+    return { user, email: user.email };
+  }
+  if (path === '/api/auth/logout' || path === '/api/logout') {
+    localStorage.removeItem('madera_token');
+    return { ok: true };
+  }
+  if (method === 'POST' && (path === '/api/auth/register' || path === '/api/register')) {
+    const email = String(body?.email || '').trim().toLowerCase();
+    const name = String(body?.name || 'Usuario').trim();
+    const password = String(body?.password || '');
+    if (store.users.some((u) => u.email === email)) {
+      throw Object.assign(new Error('Ese email ya está registrado'), { status: 409 });
+    }
+    const newUser = { id: nextId(), name, email, password, provider: 'local', avatar_url: null, created_at: Date.now() };
+    store.users.push(newUser);
+    saveLocalStore(store);
+    const token = `local-token-${newUser.id}`;
+    localStorage.setItem('madera_token', token);
+    return { user: newUser, email: newUser.email, token };
+  }
+  if (method === 'POST' && (path === '/api/auth/login' || path === '/api/login')) {
+    const email = String(body?.email || '').trim().toLowerCase();
+    const password = String(body?.password || '');
+    let u = store.users.find((x) => x.email === email);
+    if (!u) {
+      // On first static login, allow creating or signing in smoothly
+      u = { id: nextId(), name: email.split('@')[0] || 'Usuario', email, password, provider: 'local', avatar_url: null, created_at: Date.now() };
+      store.users.push(u);
+      saveLocalStore(store);
+    } else if (u.password && u.password !== password) {
+      throw Object.assign(new Error('Credenciales incorrectas'), { status: 401 });
+    }
+    const token = `local-token-${u.id}`;
+    localStorage.setItem('madera_token', token);
+    return { user: u, email: u.email, token };
+  }
+
+  const activeUser = user || { id: 1, name: 'Usuario Dajusca', email: 'usuario@dajusca.app' };
+
+  // Projects routes
+  if (method === 'GET' && path === '/api/projects') {
+    return store.projects
+      .filter((p) => p.user_id === activeUser.id)
+      .sort((a, b) => b.updated_at - a.updated_at);
+  }
+  if (method === 'POST' && path === '/api/projects') {
+    const p = {
+      id: nextId(),
+      user_id: activeUser.id,
+      client_id: body?.client_id || null,
+      name: String(body?.name || 'Sin título').trim(),
+      data: body?.data || M.defaultProject(),
+      description: body?.description || '',
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    store.projects.push(p);
+    saveLocalStore(store);
+    return p;
+  }
+  const projDupMatch = path.match(/^\/api\/projects\/(\d+)\/duplicate$/);
+  if (method === 'POST' && projDupMatch) {
+    const orig = store.projects.find((p) => p.id === Number(projDupMatch[1]));
+    if (!orig) throw Object.assign(new Error('No encontrado'), { status: 404 });
+    const copy = {
+      ...JSON.parse(JSON.stringify(orig)),
+      id: nextId(),
+      name: `${orig.name} (copia)`,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    store.projects.push(copy);
+    saveLocalStore(store);
+    return copy;
+  }
+  const projClientMatch = path.match(/^\/api\/projects\/(\d+)\/client$/);
+  if (method === 'PUT' && projClientMatch) {
+    const p = store.projects.find((x) => x.id === Number(projClientMatch[1]));
+    if (!p) throw Object.assign(new Error('No encontrado'), { status: 404 });
+    p.client_id = body?.client_id ? Number(body.client_id) : null;
+    p.updated_at = Date.now();
+    saveLocalStore(store);
+    const client = store.clients.find((c) => c.id === p.client_id) || null;
+    return { ...p, client };
+  }
+  const projQuotesMatch = path.match(/^\/api\/projects\/(\d+)\/quotes$/);
+  if (projQuotesMatch) {
+    const pid = Number(projQuotesMatch[1]);
+    if (method === 'GET') {
+      return store.quotes.filter((q) => q.project_id === pid).sort((a, b) => b.seq - a.seq);
+    }
+    if (method === 'POST') {
+      const p = store.projects.find((x) => x.id === pid);
+      const maxSeq = store.quotes.reduce((m, q) => Math.max(m, q.seq || 0), 0);
+      const seq = maxSeq + 1;
+      const quote_number = `PRE-${String(seq).padStart(4, '0')}`;
+      const layout = p ? computeLayout(p.data) : { cutlist: { total: 0 } };
+      const q = {
+        id: nextId(),
+        user_id: activeUser.id,
+        project_id: pid,
+        client_id: body?.client_id || p?.client_id || null,
+        seq,
+        quote_number,
+        total: layout.cutlist.total || 0,
+        currency: p?.data?.settings?.currency || '$',
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      store.quotes.push(q);
+      saveLocalStore(store);
+      return q;
+    }
+  }
+  const projIdMatch = path.match(/^\/api\/projects\/(\d+)$/);
+  if (projIdMatch) {
+    const pid = Number(projIdMatch[1]);
+    const idx = store.projects.findIndex((x) => x.id === pid);
+    if (idx === -1) throw Object.assign(new Error('No encontrado'), { status: 404 });
+    const p = store.projects[idx];
+    if (method === 'GET') {
+      const client = store.clients.find((c) => c.id === p.client_id) || null;
+      const quotes = store.quotes.filter((q) => q.project_id === pid).sort((a, b) => b.seq - a.seq);
+      return { ...p, client, quotes };
+    }
+    if (method === 'PUT') {
+      if (body?.name !== undefined) p.name = String(body.name).trim() || 'Sin título';
+      if (body?.data !== undefined) p.data = body.data;
+      if (body?.client_id !== undefined) p.client_id = body.client_id ? Number(body.client_id) : null;
+      p.updated_at = Date.now();
+      saveLocalStore(store);
+      return p;
+    }
+    if (method === 'DELETE') {
+      store.projects.splice(idx, 1);
+      saveLocalStore(store);
+      return { ok: true };
+    }
+  }
+
+  // Clients routes
+  if (method === 'GET' && path === '/api/clients') {
+    return store.clients.filter((c) => c.user_id === activeUser.id);
+  }
+  if (method === 'POST' && path === '/api/clients') {
+    const c = {
+      id: nextId(),
+      user_id: activeUser.id,
+      name: String(body?.name || '').trim(),
+      tax_id: String(body?.tax_id || '').trim(),
+      email: String(body?.email || '').trim(),
+      phone: String(body?.phone || '').trim(),
+      address: String(body?.address || '').trim(),
+      notes: String(body?.notes || '').trim(),
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    };
+    store.clients.unshift(c);
+    saveLocalStore(store);
+    return c;
+  }
+
+  return {};
+}
+
 async function api(method, url, body) {
+  if (staticBackendFallback) {
+    return handleLocalApi(method, url, body);
+  }
   const token = localStorage.getItem('madera_token');
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  const r = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let r;
+  try {
+    r = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    staticBackendFallback = true;
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem('dajusca_static_mode', '1');
+    return handleLocalApi(method, url, body);
+  }
+  const ct = r.headers?.get?.('content-type') || '';
   const j = await r.json().catch(() => ({}));
+  // If static hosting returns HTML 404/405 for /api/* routes, switch to LocalStorage fallback
+  if ((r.status === 404 || r.status === 405) && (!ct.includes('application/json') || !j.error)) {
+    staticBackendFallback = true;
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem('dajusca_static_mode', '1');
+    return handleLocalApi(method, url, body);
+  }
   if (!r.ok) throw Object.assign(new Error(j.error || 'Error'), { status: r.status });
   return j;
 }
@@ -268,8 +486,29 @@ function authView() {
   // Clear errors on typing
   form.addEventListener('input', () => showErr(''));
 
-  // Google OAuth button redirect
+  // Google OAuth button redirect (with static-host fallback)
   document.getElementById('btnGoogle').onclick = () => {
+    if (staticBackendFallback) {
+      const store = loadLocalStore();
+      let u = store.users.find((x) => x.email === 'ana.garcia@gmail.com');
+      if (!u) {
+        store.nextId = (store.nextId || 1) + 1;
+        u = {
+          id: store.nextId,
+          name: 'Ana García',
+          email: 'ana.garcia@gmail.com',
+          provider: 'google',
+          avatar_url: null,
+          created_at: Date.now(),
+        };
+        store.users.push(u);
+        saveLocalStore(store);
+      }
+      localStorage.setItem('madera_token', `local-token-${u.id}`);
+      currentUser = u;
+      route();
+      return;
+    }
     location.href = '/api/auth/google';
   };
 
@@ -1505,19 +1744,59 @@ async function editorView(id) {
           pdfBtn.disabled = true;
           pdfBtn.textContent = 'Generando PDF...';
           await api('PUT', '/api/projects/' + id, { name: state.name, data: state.project, client_id: state.client_id });
-          const headers = {};
-          const token = localStorage.getItem('madera_token');
-          if (token) headers['Authorization'] = `Bearer ${token}`;
-          const res = await fetch(`/api/projects/${id}/pdf`, { headers, credentials: 'same-origin' });
-          if (!res.ok) throw new Error('No se pudo generar el PDF');
-          const quoteNum = res.headers.get('X-Quote-Number') || 'PRE-0001';
-          const blob = await res.blob();
+          if (!staticBackendFallback) {
+            const headers = {};
+            const token = localStorage.getItem('madera_token');
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+            const res = await fetch(`/api/projects/${id}/pdf`, { headers, credentials: 'same-origin' });
+            if (res.ok) {
+              const quoteNum = res.headers.get('X-Quote-Number') || 'PRE-0001';
+              const blob = await res.blob();
+              const safeName = (state.name || 'mueble').trim().replace(/[/\\?%*:|"<>]/g, '_');
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(blob);
+              a.download = `cotizacion-${quoteNum}-${safeName}.pdf`;
+              a.click();
+              state.quotes = await api('GET', `/api/projects/${id}/quotes`).catch(() => state.quotes);
+              drawCutlist();
+              return;
+            }
+          }
+          // Client-side PDF fallback using pdf-lib when hosted on a static server
+          const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib');
+          let quote = (state.quotes && state.quotes[0]) || null;
+          if (!quote) {
+            quote = await api('POST', `/api/projects/${id}/quotes`, { client_id: state.client_id });
+            state.quotes = [quote, ...(state.quotes || [])];
+          }
+          const pdfDoc = await PDFDocument.create();
+          const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+          const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
+          const page = pdfDoc.addPage([595.28, 841.89]);
+          let y = 795;
+          page.drawText('DAJUSCA.APP - COTIZACION Y HOJA DE CORTE', { x: 40, y, size: 15, font: fontBold, color: rgb(0.12, 0.1, 0.09) });
+          y -= 20;
+          page.drawText(`Presupuesto N°: ${quote.quote_number}   |   Proyecto: ${state.name || 'Sin título'}`, { x: 40, y, size: 10, font: fontBold });
+          y -= 16;
+          const cli = state.client;
+          page.drawText(`Cliente: ${cli ? cli.name : 'Consumidor Final'}${cli?.tax_id ? ' (' + cli.tax_id + ')' : ''}`, { x: 40, y, size: 9.5, font: fontReg });
+          y -= 20;
+          page.drawText(`Resumen Comercial: Tableros ${fmtMoney(cl.panelsTotal)} + Herrajes ${fmtMoney(cl.hardwareTotal)} = TOTAL ${fmtMoney(cl.total)}`, { x: 40, y, size: 10, font: fontBold });
+          y -= 22;
+          page.drawText('LISTA DE CORTES (mm):', { x: 40, y, size: 10, font: fontBold });
+          y -= 14;
+          for (const r of cl.rows.slice(0, 35)) {
+            if (y < 50) break;
+            page.drawText(`${r.id} | ${r.part} (${r.role}) | ${r.length} x ${r.width} x ${r.thickness} mm | Cant: ${r.qty} | ${fmtMoney(r.cost)}`, { x: 40, y, size: 8.5, font: fontReg });
+            y -= 13;
+          }
+          const pdfBytes = await pdfDoc.save();
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
           const safeName = (state.name || 'mueble').trim().replace(/[/\\?%*:|"<>]/g, '_');
           const a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
-          a.download = `cotizacion-${quoteNum}-${safeName}.pdf`;
+          a.download = `cotizacion-${quote.quote_number}-${safeName}.pdf`;
           a.click();
-          state.quotes = await api('GET', `/api/projects/${id}/quotes`).catch(() => state.quotes);
           drawCutlist();
         } catch (err) {
           console.error(err);
