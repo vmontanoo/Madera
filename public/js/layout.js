@@ -257,7 +257,7 @@ export function computeLayout(project) {
     }
   };
 
-  const leafContents = (n, cx0, cy0, w, h, col) => {
+  const leafContents = (n, cx0, cy0, w, h, col, coveredByDoor = false) => {
     const cx = cx0 - t / 2;
     const cy = cy0 - t / 2;
     const cw = w + t;
@@ -275,23 +275,30 @@ export function computeLayout(project) {
       const inner = h / cnt;
       const sc = s.slideClearance;
       const dt = s.drawerThickness;
+      const frontZ = coveredByDoor ? D - t - 10 : D;
+      const availD = coveredByDoor ? cd - t - 10 : cd;
       const bw = Math.max(2 * dt + 5, w - 2 * sc);
-      const bd = Math.max(2 * dt + 5, cd - 20);
-      const bz = D - bd;
+      const bd = Math.max(2 * dt + 5, availD - 20);
+      const bz = frontZ - bd;
       const innerW = Math.max(30, bw - 2 * dt);
       const innerD = Math.max(30, bd - 2 * dt);
+      const insetX = coveredByDoor ? fc + 2 : fc;
+      const frontX = coveredByDoor ? cx0 + insetX : cx + fc;
+      const frontW = coveredByDoor ? Math.max(10, w - 2 * insetX) : Math.max(10, cw - 2 * fc);
       for (let i = 0; i < cnt; i++) {
         const idx = cnt - 1 - i; // el primero queda arriba
-        add({ name: 'Frente de gaveta', mat: 'front', kind: 'front', x: cx + fc, y: cy + idx * slot + fc / 2, z: D, sx: Math.max(10, cw - 2 * fc), sy: Math.max(10, slot - fc), sz: t, holes, pull: style, holeLayout: 'h', col, nodeId: n.id, drawerIndex: idx });
+        const frontY = coveredByDoor ? cy0 + idx * inner + fc / 2 : cy + idx * slot + fc / 2;
+        const frontH = coveredByDoor ? Math.max(10, inner - fc) : Math.max(10, slot - fc);
+        add({ name: 'Frente de gaveta', mat: 'front', kind: 'front', x: frontX, y: frontY, z: frontZ, sx: frontW, sy: frontH, sz: t, holes, pull: style, holeLayout: 'h', col, nodeId: n.id, drawerIndex: idx, isInternal: coveredByDoor });
         countPull(style);
         hw.slides += 1;
         const bh = Math.max(10, inner - s.drawerInset);
         const by = cy0 + idx * inner + (inner - bh) / 2;
         const bx = cx0 + sc;
-        const base = { mat: 'drawer', kind: 'drawer', col, nodeId: n.id, drawerIndex: idx };
+        const base = { mat: 'drawer', kind: 'drawer', col, nodeId: n.id, drawerIndex: idx, isInternal: coveredByDoor };
         add({ ...base, name: 'Lateral de gaveta', x: bx, y: by, z: bz, sx: dt, sy: bh, sz: bd });
         add({ ...base, name: 'Lateral de gaveta', x: bx + bw - dt, y: by, z: bz, sx: dt, sy: bh, sz: bd });
-        add({ ...base, name: 'Frente/trasera de gaveta', x: bx + dt, y: by, z: D - dt, sx: innerW, sy: bh, sz: dt });
+        add({ ...base, name: 'Frente/trasera de gaveta', x: bx + dt, y: by, z: frontZ - dt, sx: innerW, sy: bh, sz: dt });
         add({ ...base, name: 'Frente/trasera de gaveta', x: bx + dt, y: by, z: bz, sx: innerW, sy: bh, sz: dt });
         add({ ...base, name: 'Fondo de gaveta', x: bx + dt, y: by + 4, z: bz + dt, sx: innerW, sy: s.drawerBottomThickness, sz: innerD });
       }
@@ -302,13 +309,7 @@ export function computeLayout(project) {
     cells[n.id] = { id: n.id, x: px, y: py, w, h, type: n.type, dir: n.dir, col, front: n.front || 'none' };
     const kids = n.type === 'multiple' ? n.children || [] : [];
     if (!kids.length) {
-      if (!coveredByDoor) leafContents(n, px, py, w, h, col);
-      else if (n.type === 'rail') {
-        // En un closet con puertas, la barra de perchero sí va adentro
-        add({ name: 'Barra de perchero', mat: 'rail', kind: 'rail', x: px, y: py + h - s.railOffset - s.railDia, z: bt + cd / 2 - s.railDia / 2, sx: w, sy: s.railDia, sz: s.railDia, col, nodeId: n.id });
-        hw.rails += w;
-        hw.brackets += 2;
-      }
+      leafContents(n, px, py, w, h, col, coveredByDoor);
       return;
     }
     const k = kids.length;
@@ -341,7 +342,7 @@ export function computeLayout(project) {
 
   // Contenido del módulo + puertas opcionales que cubren TODO el módulo (útil para closets).
   const place = (n, px, py, w, h, col, parentCovered = false) => {
-    const hasDoor = !parentCovered && n.front && n.front !== 'none' && n.type !== 'drawer';
+    const hasDoor = !parentCovered && n.front && n.front !== 'none' && (n.type !== 'drawer' || n.front === 'doors');
     const isCovered = parentCovered || hasDoor;
     placeInner(n, px, py, w, h, col, isCovered);
     if (hasDoor) doorOverlay(n, px, py, w, h, col);

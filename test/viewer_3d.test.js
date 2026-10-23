@@ -457,7 +457,7 @@ test('M4.5: Swinging doors kinematic pivot group rotations (-90° left hinge, +9
   viewer.destroy();
 });
 
-test('M4.6: Sliding doors kinematic slide translation (+70% inner, -70% outer width)', () => {
+test('M4.6: Sliding doors kinematic slide translation clears the opening without collision', () => {
   const container = new MockElement('div');
   const viewer = new Viewer(container);
 
@@ -485,25 +485,25 @@ test('M4.6: Sliding doors kinematic slide translation (+70% inner, -70% outer wi
   const innerBaseX = inner.position.x;
   const outerBaseX = outer.position.x;
 
-  // Fully open state: inner slides +70% width, outer slides -70% width
+  // Fully open state: inner slides -100% width and outer slides +100% width (or stacks to clear drawer vano)
   viewer.openT = 1.0;
   viewer.updateKinematics(200, 0);
 
   const S = 0.001;
-  const expectedInnerDelta = +0.70 * inner.userData.piece.sx * S;
-  const expectedOuterDelta = -0.70 * outer.userData.piece.sx * S;
+  const expectedInnerDelta = -1.0 * inner.userData.piece.sx * S;
+  const expectedOuterDelta = +1.0 * outer.userData.piece.sx * S;
 
   const actualInnerDelta = inner.position.x - innerBaseX;
   const actualOuterDelta = outer.position.x - outerBaseX;
 
   const eps = 1e-4;
-  assert.ok(Math.abs(actualInnerDelta - expectedInnerDelta) < eps, `Inner leaf must slide +70% width along X: expected ${expectedInnerDelta}, got ${actualInnerDelta}`);
-  assert.ok(Math.abs(actualOuterDelta - expectedOuterDelta) < eps, `Outer leaf must slide -70% width along X: expected ${expectedOuterDelta}, got ${actualOuterDelta}`);
+  assert.ok(Math.abs(actualInnerDelta - expectedInnerDelta) < eps, `Inner leaf must clear opening along X: expected ${expectedInnerDelta}, got ${actualInnerDelta}`);
+  assert.ok(Math.abs(actualOuterDelta - expectedOuterDelta) < eps, `Outer leaf must clear opening along X: expected ${expectedOuterDelta}, got ${actualOuterDelta}`);
 
   viewer.destroy();
 });
 
-test('M4.7: Bi-fold doors 2-tier kinematic group (-45° Leaf 1 swing, +75° Leaf 2 inward fold)', () => {
+test('M4.7: Bi-fold doors 2-tier kinematic group (>90° lateral swing and accordion fold)', () => {
   const container = new MockElement('div');
   const viewer = new Viewer(container);
 
@@ -530,12 +530,13 @@ test('M4.7: Bi-fold doors 2-tier kinematic group (-45° Leaf 1 swing, +75° Leaf
   viewer.openT = 1.0;
   viewer.updateKinematics(100, 0);
 
-  const expectedAngle1 = -(45 * Math.PI / 180);
-  const expectedAngle2 = +(75 * Math.PI / 180);
+  const expectedAngle1 = -(145 * Math.PI / 180);
+  const expectedAngle2 = +(100 * Math.PI / 180);
   const eps = 1e-4;
 
-  assert.ok(Math.abs(pivotAnchor.rotation.y - expectedAngle1) < eps, `Leaf 1 must swing -45°: expected ${expectedAngle1}, got ${pivotAnchor.rotation.y}`);
-  assert.ok(Math.abs(pivotFold.rotation.y - expectedAngle2) < eps, `Leaf 2 must fold +75° inward: expected ${expectedAngle2}, got ${pivotFold.rotation.y}`);
+  assert.ok(Math.abs(pivotAnchor.rotation.y) > Math.PI / 2, 'Leaf 1 must rotate > 90° toward lateral');
+  assert.ok(Math.abs(pivotAnchor.rotation.y - expectedAngle1) < eps, `Leaf 1 must swing -145°: expected ${expectedAngle1}, got ${pivotAnchor.rotation.y}`);
+  assert.ok(Math.abs(pivotFold.rotation.y - expectedAngle2) < eps, `Leaf 2 must fold +100°: expected ${expectedAngle2}, got ${pivotFold.rotation.y}`);
 
   viewer.destroy();
 });

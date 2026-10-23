@@ -155,7 +155,7 @@ function authView() {
   <div class="center auth-wrapper">
     <div class="auth-card">
       <div class="auth-header">
-        <h2 class="auth-title">Madera local</h2>
+        <h2 class="auth-title">Dajusca.app</h2>
         <span class="auth-subtitle" id="authSubtitle">Inicia sesión en tu cuenta para acceder a tus muebles</span>
       </div>
 
@@ -402,7 +402,7 @@ async function listView() {
     <div class="list">
       <header class="list-header">
         <div class="brand-row">
-          <h2 style="margin:0">Madera local</h2>
+          <h2 style="margin:0">Dajusca.app</h2>
         </div>
         <div class="header-actions">
           <button class="primary" id="new">+ Nuevo mueble</button>
@@ -781,14 +781,20 @@ export function buildCanvasSvg(project, layout, selected = null) {
 /* ---------------- Editor ---------------- */
 async function editorView(id) {
   let rec;
+  let clientsList = [];
   try {
     rec = await api('GET', '/api/projects/' + id);
+    clientsList = await api('GET', '/api/clients').catch(() => []);
   } catch {
     location.hash = '#/';
     return;
   }
   const state = {
     name: rec.name,
+    client_id: rec.client_id || null,
+    client: rec.client || null,
+    quotes: Array.isArray(rec.quotes) ? rec.quotes : [],
+    clients: Array.isArray(clientsList) ? clientsList : [],
     project: M.normalizeProject(rec.data.columns ? rec.data : M.defaultProject()),
     selected: null,
     tab: 'design',
@@ -1304,6 +1310,8 @@ async function editorView(id) {
     const cur = s.currency || '$';
     const selRow = cl.rows.find((r) => r.id === state.cutSel);
     const dateStr = new Date().toLocaleDateString();
+    const latestQuote = state.quotes && state.quotes[0];
+    const activeClient = state.clients.find((c) => Number(c.id) === Number(state.client_id)) || state.client;
 
     $('#cutlist').innerHTML = `
       <div class="print-header">
@@ -1318,12 +1326,21 @@ async function editorView(id) {
           <span><b>Dimensiones generales:</b> ${layout.totalW} × ${layout.maxH || s.height} × ${s.depth} mm</span>
           <span class="sep">·</span>
           <span><b>Fecha:</b> ${dateStr}</span>
+          ${latestQuote ? `<span class="sep">·</span><span><b>Presupuesto:</b> ${esc(latestQuote.quote_number)}</span>` : ''}
+          ${activeClient ? `<span class="sep">·</span><span><b>Cliente:</b> ${esc(activeClient.name)}</span>` : ''}
         </div>
       </div>
 
-      <div class="btns" style="margin-bottom:12px">
+      <div class="btns" style="margin-bottom:12px;flex-wrap:wrap;gap:8px;align-items:center">
         <button id="csv">Exportar CSV</button>
         <button id="print">Imprimir / PDF</button>
+        <button id="pdfQuote" class="primary">Descargar Cotización PDF</button>
+        <button id="genQuote" title="Generar nuevo número de presupuesto correlativo">+ Emitir Presupuesto${latestQuote ? ` (${esc(latestQuote.quote_number)})` : ''}</button>
+        <select id="clientSelect" title="Asociar cliente al proyecto" style="max-width:200px">
+          <option value="">— Sin cliente asignado —</option>
+          ${state.clients.map((c) => `<option value="${c.id}" ${Number(state.client_id) === Number(c.id) ? 'selected' : ''}>${esc(c.name)}${c.tax_id ? ` (${esc(c.tax_id)})` : ''}</option>`).join('')}
+        </select>
+        <button id="newClientBtn" title="Registrar nuevo cliente">+ Cliente</button>
         <label class="muted"><input type="checkbox" id="mach" ${state.showMach ? 'checked' : ''}> Mostrar operaciones de mecanizado</label>
       </div>
 
@@ -1480,6 +1497,104 @@ async function editorView(id) {
     const printBtn = $('#print');
     if (printBtn) {
       printBtn.onclick = () => window.print();
+    }
+    const pdfBtn = $('#pdfQuote');
+    if (pdfBtn) {
+      pdfBtn.onclick = async () => {
+        try {
+          pdfBtn.disabled = true;
+          pdfBtn.textContent = 'Generando PDF...';
+          await api('PUT', '/api/projects/' + id, { name: state.name, data: state.project, client_id: state.client_id });
+          const headers = {};
+          const token = localStorage.getItem('madera_token');
+          if (token) headers['Authorization'] = `Bearer ${token}`;
+          const res = await fetch(`/api/projects/${id}/pdf`, { headers, credentials: 'same-origin' });
+          if (!res.ok) throw new Error('No se pudo generar el PDF');
+          const quoteNum = res.headers.get('X-Quote-Number') || 'PRE-0001';
+          const blob = await res.blob();
+          const safeName = (state.name || 'mueble').trim().replace(/[/\\?%*:|"<>]/g, '_');
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `cotizacion-${quoteNum}-${safeName}.pdf`;
+          a.click();
+          state.quotes = await api('GET', `/api/projects/${id}/quotes`).catch(() => state.quotes);
+          drawCutlist();
+        } catch (err) {
+          console.error(err);
+        } finally {
+          pdfBtn.disabled = false;
+          pdfBtn.textContent = 'Descargar Cotización PDF';
+        }
+      };
+    }
+    const genQuoteBtn = $('#genQuote');
+    if (genQuoteBtn) {
+      genQuoteBtn.onclick = async () => {
+        try {
+          genQuoteBtn.disabled = true;
+          const q = await api('POST', `/api/projects/${id}/quotes`, { client_id: state.client_id });
+          state.quotes = [q, ...(state.quotes || [])];
+          drawCutlist();
+        } catch (err) {
+          console.error(err);
+        } finally {
+          genQuoteBtn.disabled = false;
+        }
+      };
+    }
+    const clientSel = $('#clientSelect');
+    if (clientSel) {
+      clientSel.onchange = async (e) => {
+        const cid = e.target.value ? Number(e.target.value) : null;
+        state.client_id = cid;
+        state.client = state.clients.find((c) => Number(c.id) === cid) || null;
+        await api('PUT', `/api/projects/${id}/client`, { client_id: cid }).catch(() => {});
+        drawCutlist();
+      };
+    }
+    const newClientBtn = $('#newClientBtn');
+    if (newClientBtn) {
+      newClientBtn.onclick = () => {
+        const bg = document.createElement('div');
+        bg.className = 'modal-bg';
+        bg.innerHTML = `<div class="modal">
+          <div class="row"><b style="flex:1;font-size:16px">Nuevo Cliente</b><button id="xc">✕</button></div>
+          <div class="body" style="display:flex;flex-direction:column;gap:8px;margin:10px 0">
+            <input id="cName" placeholder="Nombre o Razón Social *" required>
+            <input id="cTax" placeholder="RUT / DNI / NIF">
+            <input id="cEmail" type="email" placeholder="Correo electrónico">
+            <input id="cPhone" placeholder="Teléfono">
+            <input id="cAddr" placeholder="Dirección">
+          </div>
+          <div class="row" style="justify-content:flex-end;gap:8px">
+            <button id="cancelC">Cancelar</button>
+            <button id="saveC" class="primary">Guardar Cliente</button>
+          </div>
+        </div>`;
+        document.body.appendChild(bg);
+        bg.querySelector('#xc').onclick = bg.querySelector('#cancelC').onclick = () => bg.remove();
+        bg.querySelector('#saveC').onclick = async () => {
+          const name = bg.querySelector('#cName').value.trim();
+          if (!name) return;
+          try {
+            const c = await api('POST', '/api/clients', {
+              name,
+              tax_id: bg.querySelector('#cTax').value.trim(),
+              email: bg.querySelector('#cEmail').value.trim(),
+              phone: bg.querySelector('#cPhone').value.trim(),
+              address: bg.querySelector('#cAddr').value.trim(),
+            });
+            state.clients.unshift(c);
+            state.client_id = c.id;
+            state.client = c;
+            await api('PUT', `/api/projects/${id}/client`, { client_id: c.id });
+            bg.remove();
+            drawCutlist();
+          } catch (err) {
+            console.error(err);
+          }
+        };
+      };
     }
   }
   const cardHtml = (r) =>

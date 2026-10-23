@@ -596,7 +596,7 @@ export class Viewer {
           : `${p.nodeId}_${Math.round(p.y / 15) * 15}`;
         let dg = drawerGroupsMap.get(key);
         if (!dg) {
-          dg = { nodeId: p.nodeId, y: p.y, drawerIndex: p.drawerIndex, pieces: [] };
+          dg = { nodeId: p.nodeId, col: p.col ?? 0, y: p.y, drawerIndex: p.drawerIndex, pieces: [] };
           drawerGroupsMap.set(key, dg);
         }
         dg.pieces.push(p);
@@ -606,21 +606,43 @@ export class Viewer {
     });
 
     // 1. Process Drawer Assemblies (Kinematic group with staircase progression from bottom to top)
-    const drawersByNode = new Map();
+    // Group drawers by horizontal X-overlap so vertically stacked drawers always form a staircase
+    // whether they belong to the same module (count > 1) or separate adjacent/nested modules.
+    const drawersByStack = [];
     drawerGroupsMap.forEach((dg) => {
-      let list = drawersByNode.get(dg.nodeId);
-      if (!list) {
-        list = [];
-        drawersByNode.set(dg.nodeId, list);
+      const cell = layout.cells && layout.cells[dg.nodeId];
+      const minX = cell ? cell.x : Math.min(...dg.pieces.map((p) => p.x));
+      const maxX = cell ? cell.x + cell.w : Math.max(...dg.pieces.map((p) => p.x + p.sx));
+      const minY = Math.min(...dg.pieces.map((p) => p.y));
+      const maxY = Math.max(...dg.pieces.map((p) => p.y + p.sy));
+      dg.minX = minX;
+      dg.maxX = maxX;
+      dg.minY = minY;
+      dg.maxY = maxY;
+      dg.centerY = (minY + maxY) / 2;
+
+      let targetStack = drawersByStack.find((stack) => {
+        const ref = stack[0];
+        if ((ref.col ?? 0) !== (dg.col ?? 0)) return false;
+        const overlapX = Math.min(ref.maxX, dg.maxX) - Math.max(ref.minX, dg.minX);
+        const minWidth = Math.min(ref.maxX - ref.minX, dg.maxX - dg.minX);
+        return overlapX > Math.max(10, minWidth * 0.5);
+      });
+      if (!targetStack) {
+        targetStack = [];
+        drawersByStack.push(targetStack);
       }
-      list.push(dg);
+      targetStack.push(dg);
     });
 
-    drawersByNode.forEach((list) => {
-      // Sort drawers vertically from bottom (lowest y / index 0) to top (highest y / index N-1)
+    drawersByStack.forEach((list) => {
+      // Sort drawers vertically from bottom (lowest Y) to top (highest Y)
       list.sort((a, b) => {
-        if (a.drawerIndex !== undefined && b.drawerIndex !== undefined) {
+        if (a.nodeId === b.nodeId && a.drawerIndex !== undefined && b.drawerIndex !== undefined) {
           return a.drawerIndex - b.drawerIndex;
+        }
+        if (Math.abs(a.centerY - b.centerY) > 1) {
+          return a.centerY - b.centerY;
         }
         return a.y - b.y;
       });
@@ -636,7 +658,8 @@ export class Viewer {
           isDrawerGroup: true,
           pieces: dg.pieces,
           nodeId: dg.nodeId,
-          drawerIndex: dg.drawerIndex !== undefined ? dg.drawerIndex : idx,
+          drawerIndex: idx,
+          moduleDrawerIndex: dg.drawerIndex !== undefined ? dg.drawerIndex : idx,
           drawerCount: N,
           openRatio,
         };
@@ -729,10 +752,10 @@ export class Viewer {
           (p1.y + p1.sy / 2) * S,
           (p1.z + p1.sz / 2 + expOz * exMul * eT) * S
         );
-        // Leaf 1 swings open -45°
-        pivotAnchor.rotation.y = -(45 * Math.PI / 180) * oT;
-        // Leaf 2 folds inward +75° accordion-style
-        pivotFold.rotation.y = +(75 * Math.PI / 180) * oT;
+        // Leaf 1 swings open > 90° (-145°) toward the lateral to clear the opening
+        pivotAnchor.rotation.y = -(145 * Math.PI / 180) * oT;
+        // Leaf 2 folds +100° (> 90°) accordion-style so both leaves clear the lateral edge
+        pivotFold.rotation.y = +(100 * Math.PI / 180) * oT;
       });
     });
 
@@ -810,9 +833,49 @@ export class Viewer {
         mesh.userData.isInner = isInner;
         this.group.add(mesh);
 
+        const innerLeaf = isInner
+          ? p
+          : otherPieces.find((op) => op.nodeId === p.nodeId && op.side === 'sliding-inner') || p;
+        const outerLeaf = !isInner
+          ? p
+          : otherPieces.find((op) => op.nodeId === p.nodeId && op.side === 'sliding-outer') || p;
+        const vanoMinX = innerLeaf.x;
+        const vanoMaxX = outerLeaf.x + outerLeaf.sx;
+        const vanoMidX = (vanoMinX + vanoMaxX) / 2;
+        const t = layout.settings?.thickness || 18;
+
+        const coveredDrawers = layout.pieces.filter(
+          (dp) =>
+            (dp.kind === 'drawer' || dp.name === 'Frente de gaveta') &&
+            dp.col === p.col &&
+            dp.y < p.y + p.sy &&
+            dp.y + dp.sy > p.y
+        );
+
+        let fullSlideX = (isInner ? -1.0 : +1.0) * p.sx;
+        if (coveredDrawers.length > 0) {
+          const dMinX = Math.min(...coveredDrawers.map((d) => d.x));
+          const dMaxX = Math.max(...coveredDrawers.map((d) => d.x + d.sx));
+          if (dMaxX <= vanoMidX + t) {
+            // Gavetas en el vano izquierdo: estacionar ambas hojas a la derecha despejando el vano
+            fullSlideX = isInner
+              ? Math.max(outerLeaf.x - innerLeaf.x, dMaxX + 6 - innerLeaf.x)
+              : Math.max(0, dMaxX + 6 - outerLeaf.x);
+          } else if (dMinX >= vanoMidX - t) {
+            // Gavetas en el vano derecho: estacionar ambas hojas a la izquierda despejando el vano
+            fullSlideX = isInner
+              ? Math.min(0, dMinX - 6 - (innerLeaf.x + innerLeaf.sx))
+              : Math.min(innerLeaf.x - outerLeaf.x, dMinX - 6 - (outerLeaf.x + outerLeaf.sx));
+          } else {
+            // Gavetas de ancho completo: despejar completamente el vano hacia ambos lados
+            fullSlideX = isInner
+              ? (dMinX - 6) - (innerLeaf.x + innerLeaf.sx)
+              : (dMaxX + 6) - outerLeaf.x;
+          }
+        }
+
         this.kinematicNodes.push((oT, eT, exMul) => {
-          // Inner slides +70% width, Outer slides -70% width
-          const slideX = (isInner ? +0.70 : -0.70) * p.sx * oT;
+          const slideX = fullSlideX * oT;
           mesh.position.set(
             (pcx + slideX + expOx * exMul * eT) * S,
             (pcy + expOy * exMul * eT) * S,

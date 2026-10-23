@@ -1,0 +1,221 @@
+--- a/public/js/app.js
++++ b/public/js/app.js
+@@ -678,6 +678,107 @@
+   }
+ }
+ 
++/* ---------------- 2D Canvas & Editor Math Helpers ---------------- */
++export function calculateTopBorderDrag(startH, deltaH, thickness = 18, childCount = 1) {
++  const childMin = 2 * thickness + childCount * 50 + (childCount - 1) * thickness;
++  const minH = Math.max(200, 2 * thickness + 50, childMin);
++  const maxH = 4000;
++  return Math.round(Math.min(maxH, Math.max(minH, startH + deltaH)));
++}
++
++export function simulateTopBorderDrag(project, colIdx, deltaH) {
++  const col = project.columns[colIdx];
++  if (!col) return null;
++  const t = project.settings?.thickness || 18;
++  const startH = (typeof col.height === 'number' && col.height > 0) ? col.height : (project.settings?.height || 1400);
++  const childCount = col.root?.type === 'multiple' && col.root?.dir === 'v' ? (col.root.children?.length || 1) : 1;
++  const newH = calculateTopBorderDrag(startH, deltaH, t, childCount);
++  col.height = newH;
++  return newH;
++}
++
++export function buildCanvasSvg(project, layout, selected = null) {
++  const s = layout.settings;
++  const maxH = layout.maxH || Math.max(...project.columns.map((c) => (typeof c.height === 'number' && c.height > 0 ? c.height : s.height)), s.height);
++  const ov = s.overhang;
++  const top = maxH + ov;
++  const Y = (y, sy) => top - (y + sy);
++  const sel = selected;
++  const selCell = sel && layout.cells[sel];
++  let svg = `<svg viewBox="${-120} ${-110} ${layout.totalW + 240} ${maxH + 2 * ov + 200}" preserveAspectRatio="xMidYMid meet">
++    <defs><pattern id="hatch" width="60" height="60" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
++      <rect width="60" height="60" fill="#ffb800"/><rect width="30" height="60" fill="#111"/></pattern></defs>`;
++  // celdas hoja (clic)
++  Object.values(layout.cells).forEach((c) => {
++    const isLeaf = c.type !== 'multiple' || !M.find(project, c.id)?.node?.children?.length;
++    if (isLeaf) svg += `<rect class="cell" data-id="${c.id}" x="${c.x}" y="${Y(c.y, c.h)}" width="${c.w}" height="${c.h}" fill="#151312" style="fill:#151312"/>`;
++  });
++  // piezas frontales
++  layout.pieces.forEach((p) => {
++    if (p.kind === 'drawer' || p.kind === 'back') return;
++    const isF = p.kind === 'front' || p.kind === 'door-front';
++    const fill = isF ? '#ffb800' : p.kind === 'rail' ? '#d4d7dc' : '#6e6763';
++    svg += `<rect x="${p.x}" y="${Y(p.y, p.sy)}" width="${p.sx}" height="${p.sy}" fill="${fill}" pointer-events="none"/>`;
++    if (isF) {
++      const r = s.pullDia / 2;
++      const top0 = Y(p.y, p.sy);
++      const dot = (x, y) => `<circle cx="${x}" cy="${y}" r="${r}" fill="#222" pointer-events="none"/>`;
++      const edgeX = p.side === 'right' ? p.x + p.sx - s.pullInset : p.x + s.pullInset;
++      if (p.pull === 'profile') {
++        svg += `<rect x="${p.x}" y="${top0}" width="${p.sx}" height="14" fill="#222" pointer-events="none"/>`;
++      } else if (p.holeLayout === 'v') {
++        const midY = top0 + p.sy / 2;
++        if (p.holes === 2) svg += dot(edgeX, midY - s.pullGap / 2) + dot(edgeX, midY + s.pullGap / 2);
++        else if (p.holes === 1) svg += dot(edgeX, midY);
++      } else {
++        const cx = p.x + p.sx / 2;
++        const cy = top0 + s.pullInset;
++        if (p.holes === 2) svg += dot(cx - s.pullGap / 2, cy) + dot(cx + s.pullGap / 2, cy);
++        else if (p.holes === 1) svg += dot(cx, cy);
++      }
++    }
++  });
++  // transparentes para clic sobre frentes
++  Object.values(layout.cells).forEach((c) => {
++    const isLeaf = c.type !== 'multiple' || !M.find(project, c.id)?.node?.children?.length;
++    if (isLeaf) svg += `<rect class="cell" data-id="${c.id}" x="${c.x}" y="${Y(c.y, c.h)}" width="${c.w}" height="${c.h}" style="fill:transparent"/>`;
++  });
++  if (selCell) svg += `<rect x="${selCell.x}" y="${Y(selCell.y, selCell.h)}" width="${selCell.w}" height="${selCell.h}" fill="url(#hatch)" opacity="0.85" pointer-events="none"/>`;
++  // Divisores arrastrables para cambiar tamaño interactivamente
++  (layout.dividers || []).forEach((d, idx) => {
++    const isV = d.axis === 'v'; // divisor horizontal que se arrastra en vertical Y
++    const cursor = d.cursor || (isV ? 'ns-resize' : 'ew-resize');
++    const pad = 8;
++    const rx = isV ? d.x : d.x - pad;
++    const ry = isV ? Y(d.y, d.h) - pad : Y(d.y, d.h);
++    const rw = isV ? d.w : d.w + 2 * pad;
++    const rh = isV ? d.h + 2 * pad : d.h;
++    const extraClass = d.type === 'col-top' ? ' col-top-handle' : '';
++    svg += `<rect class="drag-handle${extraClass}" data-didx="${idx}" x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="transparent" style="cursor:${cursor};pointer-events:all;"/>`;
++  });
++  // botones +
++  const plus = (cx, cy, act, data) =>
++    `<g class="plus" data-act="${act}" ${data}><circle cx="${cx}" cy="${cy}" r="30" fill="#ffb800"/><text x="${cx}" y="${cy + 14}" text-anchor="middle" font-size="44" font-weight="700" fill="#111">+</text></g>`;
++  let colX = 0;
++  const cols = project.columns;
++  const colHeights = layout.colHeights || cols.map((c) => (typeof c.height === 'number' && c.height > 0 ? c.height : s.height));
++  cols.forEach((c, idx) => {
++    colX += s.thickness;
++    const colH = colHeights[idx] || (typeof c.height === 'number' && c.height > 0 ? c.height : s.height);
++    const cy = top - colH - 50;
++    svg += plus(colX + c.width / 2, cy, 'top', `data-col="${c.id}"`);
++    colX += c.width;
++  });
++  const col0H = colHeights[0] || (typeof cols[0]?.height === 'number' && cols[0].height > 0 ? cols[0].height : s.height);
++  const lastColH = colHeights[cols.length - 1] || (typeof cols[cols.length - 1]?.height === 'number' && cols[cols.length - 1].height > 0 ? cols[cols.length - 1].height : s.height);
++  svg += plus(-70, top - col0H / 2, 'colLeft', '');
++  svg += plus(layout.totalW + 70, top - lastColH / 2, 'colRight', '');
++  svg += '</svg>';
++  return svg;
++}
++
+ /* ---------------- Editor ---------------- */
+ async function editorView(id) {
+@@ -766,101 +867,6 @@
+   const fmtMoney = (v) => state.project.settings.currency + v.toFixed(2);
+   const m3 = (mm) => (mm / 1000).toFixed(3).replace(/\.?0+$/, '') || '0';
+ 
+-export function calculateTopBorderDrag(startH, deltaH, thickness = 18, childCount = 1) {
+-  const childMin = 2 * thickness + childCount * 50 + (childCount - 1) * thickness;
+-  const minH = Math.max(200, 2 * thickness + 50, childMin);
+-  const maxH = 4000;
+-  return Math.round(Math.min(maxH, Math.max(minH, startH + deltaH)));
+-}
+-
+-export function simulateTopBorderDrag(project, colIdx, deltaH) {
+-  const col = project.columns[colIdx];
+-  if (!col) return null;
+-  const t = project.settings?.thickness || 18;
+-  const startH = (typeof col.height === 'number' && col.height > 0) ? col.height : (project.settings?.height || 1400);
+-  const childCount = col.root?.type === 'multiple' && col.root?.dir === 'v' ? (col.root.children?.length || 1) : 1;
+-  const newH = calculateTopBorderDrag(startH, deltaH, t, childCount);
+-  col.height = newH;
+-  return newH;
+-}
+-
+-export function buildCanvasSvg(project, layout, selected = null) {
+-  const s = layout.settings;
+-  const maxH = layout.maxH || Math.max(...project.columns.map((c) => (typeof c.height === 'number' && c.height > 0 ? c.height : s.height)), s.height);
+-  const ov = s.overhang;
+-  const top = maxH + ov;
+-  const Y = (y, sy) => top - (y + sy);
+-  const sel = selected;
+-  const selCell = sel && layout.cells[sel];
+-  let svg = `<svg viewBox="${-120} ${-110} ${layout.totalW + 240} ${maxH + 2 * ov + 200}" preserveAspectRatio="xMidYMid meet">
+-    <defs><pattern id="hatch" width="60" height="60" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+-      <rect width="60" height="60" fill="#ffb800"/><rect width="30" height="60" fill="#111"/></pattern></defs>`;
+-  // celdas hoja (clic)
+-  Object.values(layout.cells).forEach((c) => {
+-    const isLeaf = c.type !== 'multiple' || !M.find(project, c.id)?.node?.children?.length;
+-    if (isLeaf) svg += `<rect class="cell" data-id="${c.id}" x="${c.x}" y="${Y(c.y, c.h)}" width="${c.w}" height="${c.h}" fill="#151312" style="fill:#151312"/>`;
+-  });
+-  // piezas frontales
+-  layout.pieces.forEach((p) => {
+-    if (p.kind === 'drawer' || p.kind === 'back') return;
+-    const isF = p.kind === 'front' || p.kind === 'door-front';
+-    const fill = isF ? '#ffb800' : p.kind === 'rail' ? '#d4d7dc' : '#6e6763';
+-    svg += `<rect x="${p.x}" y="${Y(p.y, p.sy)}" width="${p.sx}" height="${p.sy}" fill="${fill}" pointer-events="none"/>`;
+-    if (isF) {
+-      const r = s.pullDia / 2;
+-      const top0 = Y(p.y, p.sy);
+-      const dot = (x, y) => `<circle cx="${x}" cy="${y}" r="${r}" fill="#222" pointer-events="none"/>`;
+-      const edgeX = p.side === 'right' ? p.x + p.sx - s.pullInset : p.x + s.pullInset;
+-      if (p.pull === 'profile') {
+-        svg += `<rect x="${p.x}" y="${top0}" width="${p.sx}" height="14" fill="#222" pointer-events="none"/>`;
+-      } else if (p.holeLayout === 'v') {
+-        const midY = top0 + p.sy / 2;
+-        if (p.holes === 2) svg += dot(edgeX, midY - s.pullGap / 2) + dot(edgeX, midY + s.pullGap / 2);
+-        else if (p.holes === 1) svg += dot(edgeX, midY);
+-      } else {
+-        const cx = p.x + p.sx / 2;
+-        const cy = top0 + s.pullInset;
+-        if (p.holes === 2) svg += dot(cx - s.pullGap / 2, cy) + dot(cx + s.pullGap / 2, cy);
+-        else if (p.holes === 1) svg += dot(cx, cy);
+-      }
+-    }
+-  });
+-  // transparentes para clic sobre frentes
+-  Object.values(layout.cells).forEach((c) => {
+-    const isLeaf = c.type !== 'multiple' || !M.find(project, c.id)?.node?.children?.length;
+-    if (isLeaf) svg += `<rect class="cell" data-id="${c.id}" x="${c.x}" y="${Y(c.y, c.h)}" width="${c.w}" height="${c.h}" style="fill:transparent"/>`;
+-  });
+-  if (selCell) svg += `<rect x="${selCell.x}" y="${Y(selCell.y, selCell.h)}" width="${selCell.w}" height="${selCell.h}" fill="url(#hatch)" opacity="0.85" pointer-events="none"/>`;
+-  // Divisores arrastrables para cambiar tamaño interactivamente
+-  (layout.dividers || []).forEach((d, idx) => {
+-    const isV = d.axis === 'v'; // divisor horizontal que se arrastra en vertical Y
+-    const cursor = d.cursor || (isV ? 'ns-resize' : 'ew-resize');
+-    const pad = 8;
+-    const rx = isV ? d.x : d.x - pad;
+-    const ry = isV ? Y(d.y, d.h) - pad : Y(d.y, d.h);
+-    const rw = isV ? d.w : d.w + 2 * pad;
+-    const rh = isV ? d.h + 2 * pad : d.h;
+-    const extraClass = d.type === 'col-top' ? ' col-top-handle' : '';
+-    svg += `<rect class="drag-handle${extraClass}" data-didx="${idx}" x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="transparent" style="cursor:${cursor};pointer-events:all;"/>`;
+-  });
+-  // botones +
+-  const plus = (cx, cy, act, data) =>
+-    `<g class="plus" data-act="${act}" ${data}><circle cx="${cx}" cy="${cy}" r="30" fill="#ffb800"/><text x="${cx}" y="${cy + 14}" text-anchor="middle" font-size="44" font-weight="700" fill="#111">+</text></g>`;
+-  let colX = 0;
+-  const cols = project.columns;
+-  const colHeights = layout.colHeights || cols.map((c) => (typeof c.height === 'number' && c.height > 0 ? c.height : s.height));
+-  cols.forEach((c, idx) => {
+-    colX += s.thickness;
+-    const colH = colHeights[idx] || (typeof c.height === 'number' && c.height > 0 ? c.height : s.height);
+-    const cy = top - colH - 50;
+-    svg += plus(colX + c.width / 2, cy, 'top', `data-col="${c.id}"`);
+-    colX += c.width;
+-  });
+-  const col0H = colHeights[0] || (typeof cols[0]?.height === 'number' && cols[0].height > 0 ? cols[0].height : s.height);
+-  const lastColH = colHeights[cols.length - 1] || (typeof cols[cols.length - 1]?.height === 'number' && cols[cols.length - 1].height > 0 ? cols[cols.length - 1].height : s.height);
+-  svg += plus(-70, top - col0H / 2, 'colLeft', '');
+-  svg += plus(layout.totalW + 70, top - lastColH / 2, 'colRight', '');
+-  svg += '</svg>';
+-  return svg;
+-}
+-
+   function drawCanvas() {
+     const s = layout.settings;
+     const svg = buildCanvasSvg(state.project, layout, state.selected);
+@@ -928,7 +934,7 @@
+             const curPt = getSvgCoords(moveEvt);
+             // En SVG, mover hacia arriba disminuye curPt.y, lo que aumenta la altura del mueble
+             const deltaH = startPt.y - curPt.y;
+-            const newH = Math.round(Math.min(maxH, Math.max(minH, startH + deltaH)));
++            const newH = calculateTopBorderDrag(startH, deltaH, t, childCount);
+             col.height = newH;
+             refresh();
+           };

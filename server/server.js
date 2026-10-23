@@ -5,10 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import { promisify } from 'node:util';
+import { PDFDocument, StandardFonts, rgb, PDFName, PDFString } from 'pdf-lib';
+import { computeLayout, DEFAULTS } from '../public/js/layout.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.APP_PORT) || 3000;
 
 // ============================================================================
 // 1. DATABASE INITIALIZATION & AUTO-MIGRATIONS
@@ -39,15 +41,47 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at INTEGER NOT NULL,
   expires_at INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS clients (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  email TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  tax_id TEXT DEFAULT '',
+  address TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  created_at INTEGER DEFAULT 0,
+  updated_at INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
   name TEXT NOT NULL,
   data TEXT NOT NULL,
   description TEXT DEFAULT '',
   thumbnail TEXT DEFAULT '',
   created_at INTEGER DEFAULT 0,
   updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quotes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+  seq INTEGER NOT NULL,
+  quote_number TEXT NOT NULL,
+  status TEXT DEFAULT 'draft',
+  subtotal REAL DEFAULT 0,
+  tax_rate REAL DEFAULT 0,
+  tax_amount REAL DEFAULT 0,
+  discount REAL DEFAULT 0,
+  total REAL DEFAULT 0,
+  currency TEXT DEFAULT '$',
+  notes TEXT DEFAULT '',
+  snapshot TEXT DEFAULT '{}',
+  created_at INTEGER DEFAULT 0,
+  updated_at INTEGER DEFAULT 0
 );
 `);
 
@@ -63,6 +97,41 @@ function migrateDb(database) {
       return new Set();
     }
   };
+
+  // Ensure clients and quotes tables exist on legacy databases
+  database.exec(`
+  CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    email TEXT DEFAULT '',
+    phone TEXT DEFAULT '',
+    tax_id TEXT DEFAULT '',
+    address TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    created_at INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+    seq INTEGER NOT NULL,
+    quote_number TEXT NOT NULL,
+    status TEXT DEFAULT 'draft',
+    subtotal REAL DEFAULT 0,
+    tax_rate REAL DEFAULT 0,
+    tax_amount REAL DEFAULT 0,
+    discount REAL DEFAULT 0,
+    total REAL DEFAULT 0,
+    currency TEXT DEFAULT '$',
+    notes TEXT DEFAULT '',
+    snapshot TEXT DEFAULT '{}',
+    created_at INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT 0
+  );
+  `);
 
   // Migrate users table
   const userCols = getColumns('users');
@@ -100,6 +169,63 @@ function migrateDb(database) {
   if (!projectCols.has('created_at')) {
     database.exec('ALTER TABLE projects ADD COLUMN created_at INTEGER DEFAULT 0;');
   }
+  if (!projectCols.has('client_id')) {
+    database.exec('ALTER TABLE projects ADD COLUMN client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL;');
+  }
+
+  // Migrate clients table
+  const clientCols = getColumns('clients');
+  if (!clientCols.has('tax_id')) {
+    database.exec("ALTER TABLE clients ADD COLUMN tax_id TEXT DEFAULT '';");
+  }
+  if (!clientCols.has('address')) {
+    database.exec("ALTER TABLE clients ADD COLUMN address TEXT DEFAULT '';");
+  }
+  if (!clientCols.has('notes')) {
+    database.exec("ALTER TABLE clients ADD COLUMN notes TEXT DEFAULT '';");
+  }
+  if (!clientCols.has('updated_at')) {
+    database.exec('ALTER TABLE clients ADD COLUMN updated_at INTEGER DEFAULT 0;');
+  }
+
+  // Migrate quotes table
+  const quoteCols = getColumns('quotes');
+  if (!quoteCols.has('seq')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN seq INTEGER NOT NULL DEFAULT 1;');
+  }
+  if (!quoteCols.has('quote_number')) {
+    database.exec("ALTER TABLE quotes ADD COLUMN quote_number TEXT NOT NULL DEFAULT 'PRE-0001';");
+  }
+  if (!quoteCols.has('status')) {
+    database.exec("ALTER TABLE quotes ADD COLUMN status TEXT DEFAULT 'draft';");
+  }
+  if (!quoteCols.has('subtotal')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN subtotal REAL DEFAULT 0;');
+  }
+  if (!quoteCols.has('tax_rate')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN tax_rate REAL DEFAULT 0;');
+  }
+  if (!quoteCols.has('tax_amount')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN tax_amount REAL DEFAULT 0;');
+  }
+  if (!quoteCols.has('discount')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN discount REAL DEFAULT 0;');
+  }
+  if (!quoteCols.has('total')) {
+    database.exec('ALTER TABLE quotes ADD COLUMN total REAL DEFAULT 0;');
+  }
+  if (!quoteCols.has('currency')) {
+    database.exec("ALTER TABLE quotes ADD COLUMN currency TEXT DEFAULT '$';");
+  }
+  if (!quoteCols.has('notes')) {
+    database.exec("ALTER TABLE quotes ADD COLUMN notes TEXT DEFAULT '';");
+  }
+  if (!quoteCols.has('snapshot')) {
+    database.exec("ALTER TABLE quotes ADD COLUMN snapshot TEXT DEFAULT '{}';");
+  }
+  database.exec('CREATE INDEX IF NOT EXISTS idx_quotes_user_seq ON quotes(user_id, seq);');
+  database.exec('CREATE INDEX IF NOT EXISTS idx_quotes_project ON quotes(project_id);');
+  database.exec('CREATE INDEX IF NOT EXISTS idx_projects_client ON projects(client_id);');
 }
 
 migrateDb(db);
@@ -641,23 +767,391 @@ app.post('/api/auth/google/mock', (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// 4.6 Projects API
+// 4.6 Clients & Correlative Quotes Helpers
+// ----------------------------------------------------------------------------
+function formatQuoteNumber(seq) {
+  return `PRE-${String(Math.max(1, Number(seq) || 1)).padStart(4, '0')}`;
+}
+
+function getNextQuoteSeq(userId) {
+  const row = db
+    .prepare('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM quotes WHERE user_id = ?')
+    .get(userId);
+  return Number(row?.max_seq || 0) + 1;
+}
+
+const ownClient = (userId, clientId) => {
+  if (!clientId) return null;
+  return db
+    .prepare('SELECT * FROM clients WHERE id = ? AND user_id = ?')
+    .get(Number(clientId), userId);
+};
+
+function createQuoteRecord(userId, payload = {}) {
+  const projectIdRaw = payload.project_id ?? payload.projectId ?? null;
+  const project = projectIdRaw
+    ? db.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').get(Number(projectIdRaw), userId)
+    : null;
+
+  if (projectIdRaw && !project) {
+    const err = new Error('Proyecto no encontrado');
+    err.status = 404;
+    throw err;
+  }
+
+  const clientIdRaw =
+    payload.client_id !== undefined
+      ? payload.client_id
+      : payload.clientId !== undefined
+      ? payload.clientId
+      : project?.client_id ?? null;
+
+  let validClientId = null;
+  let clientObj = null;
+  if (clientIdRaw !== null && clientIdRaw !== undefined && clientIdRaw !== '') {
+    clientObj = ownClient(userId, clientIdRaw);
+    if (!clientObj) {
+      const err = new Error('Cliente no encontrado');
+      err.status = 404;
+      throw err;
+    }
+    validClientId = clientObj.id;
+  }
+
+  let calcSubtotal = Number(payload.subtotal);
+  let currency = payload.currency || '$';
+  let snapshotObj = payload.snapshot || {};
+
+  if (project) {
+    try {
+      const pData = JSON.parse(project.data || '{}');
+      const layout = computeLayout(pData);
+      currency = layout.settings?.currency || DEFAULTS.currency || '$';
+      if (!Number.isFinite(calcSubtotal)) {
+        calcSubtotal = Number(layout.cutlist?.total || 0);
+      }
+      snapshotObj = {
+        project_name: project.name,
+        dimensions: {
+          width: layout.totalW,
+          height: layout.maxH || layout.settings?.height,
+          depth: layout.settings?.depth,
+          thickness: layout.settings?.thickness,
+        },
+        panelsTotal: layout.cutlist?.panelsTotal || 0,
+        hardwareTotal: layout.cutlist?.hardwareTotal || 0,
+        area: layout.cutlist?.area || 0,
+        total: layout.cutlist?.total || 0,
+        rowsCount: layout.cutlist?.rows?.length || 0,
+      };
+    } catch {
+      if (!Number.isFinite(calcSubtotal)) calcSubtotal = 0;
+    }
+  } else if (!Number.isFinite(calcSubtotal)) {
+    calcSubtotal = 0;
+  }
+
+  const taxRate = Number(payload.tax_rate ?? payload.taxRate ?? 0) || 0;
+  const discount = Number(payload.discount ?? 0) || 0;
+  const taxable = Math.max(0, calcSubtotal - discount);
+  const taxAmount =
+    payload.tax_amount !== undefined
+      ? Number(payload.tax_amount)
+      : Number(((taxable * taxRate) / 100).toFixed(2));
+  const total =
+    payload.total !== undefined
+      ? Number(payload.total)
+      : Number((taxable + taxAmount).toFixed(2));
+
+  const seq = getNextQuoteSeq(userId);
+  const quoteNumber = formatQuoteNumber(seq);
+  const status = String(payload.status || 'issued').trim() || 'issued';
+  const notes = String(payload.notes || '').trim();
+  const now = Date.now();
+
+  const r = db
+    .prepare(
+      `INSERT INTO quotes (
+        user_id, project_id, client_id, seq, quote_number, status,
+        subtotal, tax_rate, tax_amount, discount, total, currency,
+        notes, snapshot, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      userId,
+      project ? project.id : null,
+      validClientId,
+      seq,
+      quoteNumber,
+      status,
+      calcSubtotal,
+      taxRate,
+      taxAmount,
+      discount,
+      total,
+      currency,
+      notes,
+      typeof snapshotObj === 'string' ? snapshotObj : JSON.stringify(snapshotObj),
+      now,
+      now
+    );
+
+  const id = Number(r.lastInsertRowid);
+  return {
+    id,
+    user_id: userId,
+    project_id: project ? project.id : null,
+    project_name: project ? project.name : null,
+    client_id: validClientId,
+    client_name: clientObj ? clientObj.name : null,
+    seq,
+    quote_number: quoteNumber,
+    number: quoteNumber,
+    status,
+    subtotal: calcSubtotal,
+    tax_rate: taxRate,
+    tax_amount: taxAmount,
+    discount,
+    total,
+    currency,
+    notes,
+    snapshot: snapshotObj,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// 4.7 Clients REST API
+// ----------------------------------------------------------------------------
+app.get('/api/clients', auth, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM projects p WHERE p.client_id = c.id) AS projects_count,
+              (SELECT COUNT(*) FROM quotes q WHERE q.client_id = c.id) AS quotes_count
+       FROM clients c
+       WHERE c.user_id = ?
+       ORDER BY c.updated_at DESC, c.id DESC`
+    )
+    .all(req.user.id);
+  res.json(rows);
+});
+
+app.post('/api/clients', auth, (req, res) => {
+  const body = req.body || {};
+  const name = String(body.name || '').trim();
+  if (!name) {
+    return res.status(400).json({ error: 'El nombre del cliente es obligatorio' });
+  }
+  const email = String(body.email || '').trim();
+  const phone = String(body.phone || body.telefono || '').trim();
+  const tax_id = String(body.tax_id || body.rut || body.dni || body.nif || '').trim();
+  const address = String(body.address || body.direccion || '').trim();
+  const notes = String(body.notes || body.notas || '').trim();
+  const now = Date.now();
+
+  const r = db
+    .prepare(
+      `INSERT INTO clients (user_id, name, email, phone, tax_id, address, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(req.user.id, name, email, phone, tax_id, address, notes, now, now);
+
+  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(Number(r.lastInsertRowid));
+  res.status(201).json(client);
+});
+
+app.get('/api/clients/:id', auth, (req, res) => {
+  const c = ownClient(req.user.id, req.params.id);
+  if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+  const projects = db
+    .prepare('SELECT id, name, description, thumbnail, client_id, updated_at, created_at FROM projects WHERE client_id = ? AND user_id = ? ORDER BY updated_at DESC')
+    .all(c.id, req.user.id);
+  const quotes = db
+    .prepare('SELECT * FROM quotes WHERE client_id = ? AND user_id = ? ORDER BY seq DESC')
+    .all(c.id, req.user.id)
+    .map((q) => ({ ...q, number: q.quote_number }));
+  res.json({ ...c, projects, quotes });
+});
+
+const updateClientHandler = (req, res) => {
+  const c = ownClient(req.user.id, req.params.id);
+  if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+  const body = req.body || {};
+  const name = body.name !== undefined ? String(body.name).trim() : c.name;
+  if (!name) {
+    return res.status(400).json({ error: 'El nombre del cliente no puede estar vacío' });
+  }
+  const email = body.email !== undefined ? String(body.email).trim() : c.email;
+  const phone = (body.phone ?? body.telefono) !== undefined ? String(body.phone ?? body.telefono).trim() : c.phone;
+  const tax_id = (body.tax_id ?? body.rut ?? body.dni ?? body.nif) !== undefined ? String(body.tax_id ?? body.rut ?? body.dni ?? body.nif).trim() : c.tax_id;
+  const address = (body.address ?? body.direccion) !== undefined ? String(body.address ?? body.direccion).trim() : c.address;
+  const notes = (body.notes ?? body.notas) !== undefined ? String(body.notes ?? body.notas).trim() : c.notes;
+  const now = Date.now();
+
+  db.prepare(
+    `UPDATE clients
+     SET name = ?, email = ?, phone = ?, tax_id = ?, address = ?, notes = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(name, email, phone, tax_id, address, notes, now, c.id);
+
+  const updated = db.prepare('SELECT * FROM clients WHERE id = ?').get(c.id);
+  res.json({ ok: true, client: updated, ...updated });
+};
+
+app.put('/api/clients/:id', auth, updateClientHandler);
+app.patch('/api/clients/:id', auth, updateClientHandler);
+
+app.delete('/api/clients/:id', auth, (req, res) => {
+  const c = ownClient(req.user.id, req.params.id);
+  if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+  db.prepare('UPDATE projects SET client_id = NULL WHERE client_id = ? AND user_id = ?').run(c.id, req.user.id);
+  db.prepare('DELETE FROM clients WHERE id = ?').run(c.id);
+  res.json({ ok: true });
+});
+
+// ----------------------------------------------------------------------------
+// 4.8 Quotes (Presupuestos Correlativos) REST API
+// ----------------------------------------------------------------------------
+app.get('/api/quotes', auth, (req, res) => {
+  const { project_id, client_id } = req.query;
+  let sql = `
+    SELECT q.*, c.name AS client_name, c.email AS client_email, c.tax_id AS client_tax_id,
+           p.name AS project_name
+    FROM quotes q
+    LEFT JOIN clients c ON c.id = q.client_id
+    LEFT JOIN projects p ON p.id = q.project_id
+    WHERE q.user_id = ?
+  `;
+  const params = [req.user.id];
+  if (project_id) {
+    sql += ' AND q.project_id = ?';
+    params.push(Number(project_id));
+  }
+  if (client_id) {
+    sql += ' AND q.client_id = ?';
+    params.push(Number(client_id));
+  }
+  sql += ' ORDER BY q.seq DESC, q.id DESC';
+  const rows = db.prepare(sql).all(...params).map((q) => ({
+    ...q,
+    number: q.quote_number,
+  }));
+  res.json(rows);
+});
+
+app.post('/api/quotes', auth, (req, res) => {
+  try {
+    const created = createQuoteRecord(req.user.id, req.body || {});
+    res.status(201).json(created);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || 'Error al crear presupuesto' });
+  }
+});
+
+app.get('/api/quotes/:id', auth, (req, res) => {
+  const q = db
+    .prepare(
+      `SELECT q.*, c.name AS client_name, c.email AS client_email, c.phone AS client_phone,
+              c.tax_id AS client_tax_id, c.address AS client_address, p.name AS project_name
+       FROM quotes q
+       LEFT JOIN clients c ON c.id = q.client_id
+       LEFT JOIN projects p ON p.id = q.project_id
+       WHERE q.id = ? AND q.user_id = ?`
+    )
+    .get(Number(req.params.id), req.user.id);
+  if (!q) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+  let snapshot = {};
+  try {
+    snapshot = JSON.parse(q.snapshot || '{}');
+  } catch {}
+  res.json({ ...q, number: q.quote_number, snapshot });
+});
+
+const updateQuoteHandler = (req, res) => {
+  const q = db
+    .prepare('SELECT * FROM quotes WHERE id = ? AND user_id = ?')
+    .get(Number(req.params.id), req.user.id);
+  if (!q) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+
+  const body = req.body || {};
+  let clientId = q.client_id;
+  if (body.client_id !== undefined || body.clientId !== undefined) {
+    const rawCid = body.client_id !== undefined ? body.client_id : body.clientId;
+    if (rawCid === null || rawCid === '') {
+      clientId = null;
+    } else {
+      const c = ownClient(req.user.id, rawCid);
+      if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+      clientId = c.id;
+    }
+  }
+
+  const status = body.status !== undefined ? String(body.status) : q.status;
+  const notes = body.notes !== undefined ? String(body.notes) : q.notes;
+  const subtotal = body.subtotal !== undefined ? Number(body.subtotal) : q.subtotal;
+  const discount = body.discount !== undefined ? Number(body.discount) : q.discount;
+  const taxRate = (body.tax_rate ?? body.taxRate) !== undefined ? Number(body.tax_rate ?? body.taxRate) : q.tax_rate;
+  const taxable = Math.max(0, subtotal - discount);
+  const taxAmount = body.tax_amount !== undefined ? Number(body.tax_amount) : Number(((taxable * taxRate) / 100).toFixed(2));
+  const total = body.total !== undefined ? Number(body.total) : Number((taxable + taxAmount).toFixed(2));
+  const now = Date.now();
+
+  db.prepare(
+    `UPDATE quotes
+     SET client_id = ?, status = ?, notes = ?, subtotal = ?, discount = ?, tax_rate = ?, tax_amount = ?, total = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(clientId, status, notes, subtotal, discount, taxRate, taxAmount, total, now, q.id);
+
+  const updated = db.prepare('SELECT * FROM quotes WHERE id = ?').get(q.id);
+  res.json({ ok: true, quote: { ...updated, number: updated.quote_number }, ...updated, number: updated.quote_number });
+};
+
+app.put('/api/quotes/:id', auth, updateQuoteHandler);
+app.patch('/api/quotes/:id', auth, updateQuoteHandler);
+
+app.delete('/api/quotes/:id', auth, (req, res) => {
+  const q = db
+    .prepare('SELECT * FROM quotes WHERE id = ? AND user_id = ?')
+    .get(Number(req.params.id), req.user.id);
+  if (!q) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+  db.prepare('DELETE FROM quotes WHERE id = ?').run(q.id);
+  res.json({ ok: true });
+});
+
+// ----------------------------------------------------------------------------
+// 4.9 Projects API (with Client Association & PDF Export)
 // ----------------------------------------------------------------------------
 app.get('/api/projects', auth, (req, res) => {
-  res.json(
-    db
-      .prepare('SELECT id, name, description, thumbnail, updated_at, created_at FROM projects WHERE user_id = ? ORDER BY updated_at DESC')
-      .all(req.user.id)
-  );
+  const rows = db
+    .prepare(
+      `SELECT p.id, p.name, p.description, p.thumbnail, p.client_id,
+              c.name AS client_name, c.email AS client_email, c.tax_id AS client_tax_id,
+              p.updated_at, p.created_at
+       FROM projects p
+       LEFT JOIN clients c ON c.id = p.client_id
+       WHERE p.user_id = ?
+       ORDER BY p.updated_at DESC`
+    )
+    .all(req.user.id);
+  res.json(rows);
 });
 
 app.post('/api/projects', auth, (req, res) => {
-  const { name, data, description, thumbnail } = req.body || {};
+  const { name, data, description, thumbnail, client_id, clientId } = req.body || {};
+  const rawCid = client_id !== undefined ? client_id : clientId;
+  let validClientId = null;
+  if (rawCid !== undefined && rawCid !== null && rawCid !== '') {
+    const c = ownClient(req.user.id, rawCid);
+    if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+    validClientId = c.id;
+  }
   const now = Date.now();
   const r = db
-    .prepare('INSERT INTO projects (user_id, name, data, description, thumbnail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(req.user.id, name || 'Sin título', JSON.stringify(data || {}), description || '', thumbnail || '', now, now);
-  res.status(201).json({ id: Number(r.lastInsertRowid), name: name || 'Sin título', updated_at: now });
+    .prepare('INSERT INTO projects (user_id, client_id, name, data, description, thumbnail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, validClientId, name || 'Sin título', JSON.stringify(data || {}), description || '', thumbnail || '', now, now);
+  res.status(201).json({ id: Number(r.lastInsertRowid), name: name || 'Sin título', client_id: validClientId, updated_at: now });
 });
 
 const own = (req) =>
@@ -666,11 +1160,19 @@ const own = (req) =>
 app.get('/api/projects/:id', auth, (req, res) => {
   const p = own(req);
   if (!p) return res.status(404).json({ error: 'No encontrado' });
+  const client = p.client_id ? ownClient(req.user.id, p.client_id) : null;
+  const quotes = db
+    .prepare('SELECT * FROM quotes WHERE project_id = ? AND user_id = ? ORDER BY seq DESC, id DESC')
+    .all(p.id, req.user.id)
+    .map((q) => ({ ...q, number: q.quote_number }));
   res.json({
     id: p.id,
     name: p.name,
     description: p.description || '',
     thumbnail: p.thumbnail || '',
+    client_id: p.client_id || null,
+    client: client || null,
+    quotes,
     data: JSON.parse(p.data),
     updated_at: p.updated_at,
     created_at: p.created_at,
@@ -680,16 +1182,76 @@ app.get('/api/projects/:id', auth, (req, res) => {
 app.put('/api/projects/:id', auth, (req, res) => {
   const p = own(req);
   if (!p) return res.status(404).json({ error: 'No encontrado' });
-  const { name, data, description, thumbnail } = req.body || {};
-  db.prepare('UPDATE projects SET name = ?, data = ?, description = ?, thumbnail = ?, updated_at = ? WHERE id = ?').run(
+  const { name, data, description, thumbnail, client_id, clientId } = req.body || {};
+  let nextClientId = p.client_id ?? null;
+  if (client_id !== undefined || clientId !== undefined) {
+    const rawCid = client_id !== undefined ? client_id : clientId;
+    if (rawCid === null || rawCid === '') {
+      nextClientId = null;
+    } else {
+      const c = ownClient(req.user.id, rawCid);
+      if (!c) return res.status(404).json({ error: 'Cliente no encontrado' });
+      nextClientId = c.id;
+    }
+  }
+  db.prepare('UPDATE projects SET name = ?, data = ?, description = ?, thumbnail = ?, client_id = ?, updated_at = ? WHERE id = ?').run(
     name ?? p.name,
     data ? JSON.stringify(data) : p.data,
     description ?? p.description,
     thumbnail ?? p.thumbnail,
+    nextClientId,
     Date.now(),
     p.id
   );
-  res.json({ ok: true });
+  res.json({ ok: true, client_id: nextClientId });
+});
+
+const assignProjectClientHandler = (req, res) => {
+  const p = own(req);
+  if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const body = req.body || {};
+  const rawCid = body.client_id !== undefined ? body.client_id : body.clientId;
+  let nextClientId = null;
+  let clientObj = null;
+  if (rawCid !== null && rawCid !== undefined && rawCid !== '') {
+    clientObj = ownClient(req.user.id, rawCid);
+    if (!clientObj) return res.status(404).json({ error: 'Cliente no encontrado' });
+    nextClientId = clientObj.id;
+  }
+  const now = Date.now();
+  db.prepare('UPDATE projects SET client_id = ?, updated_at = ? WHERE id = ?').run(nextClientId, now, p.id);
+  res.json({ ok: true, id: p.id, project_id: p.id, client_id: nextClientId, client: clientObj });
+};
+
+app.put('/api/projects/:id/client', auth, assignProjectClientHandler);
+app.post('/api/projects/:id/client', auth, assignProjectClientHandler);
+app.patch('/api/projects/:id/client', auth, assignProjectClientHandler);
+
+app.get('/api/projects/:id/quotes', auth, (req, res) => {
+  const p = own(req);
+  if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  const rows = db
+    .prepare(
+      `SELECT q.*, c.name AS client_name, c.email AS client_email, c.tax_id AS client_tax_id
+       FROM quotes q
+       LEFT JOIN clients c ON c.id = q.client_id
+       WHERE q.project_id = ? AND q.user_id = ?
+       ORDER BY q.seq DESC, q.id DESC`
+    )
+    .all(p.id, req.user.id)
+    .map((q) => ({ ...q, number: q.quote_number }));
+  res.json(rows);
+});
+
+app.post('/api/projects/:id/quotes', auth, (req, res) => {
+  const p = own(req);
+  if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+  try {
+    const created = createQuoteRecord(req.user.id, { ...(req.body || {}), project_id: p.id });
+    res.status(201).json(created);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || 'Error al generar presupuesto' });
+  }
 });
 
 app.post('/api/projects/:id/duplicate', auth, (req, res) => {
@@ -697,8 +1259,8 @@ app.post('/api/projects/:id/duplicate', auth, (req, res) => {
   if (!p) return res.status(404).json({ error: 'No encontrado' });
   const now = Date.now();
   const r = db
-    .prepare('INSERT INTO projects (user_id, name, data, description, thumbnail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(req.user.id, p.name + ' copy', p.data, p.description || '', p.thumbnail || '', now, now);
+    .prepare('INSERT INTO projects (user_id, client_id, name, data, description, thumbnail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(req.user.id, p.client_id || null, p.name + ' copy', p.data, p.description || '', p.thumbnail || '', now, now);
   res.status(201).json({ id: Number(r.lastInsertRowid) });
 });
 
@@ -709,10 +1271,362 @@ app.delete('/api/projects/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ----------------------------------------------------------------------------
+// 4.10 Formal Quotation PDF Generator (/api/projects/:id/pdf)
+// ----------------------------------------------------------------------------
+function pdfSafeText(str) {
+  return String(str ?? '')
+    .replace(/×/g, 'x')
+    .replace(/Ø/g, 'Diam.')
+    .replace(/[—–]/g, '-')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/•/g, '-')
+    .replace(/[^\x20-\x7E\xA0-\xFF]/g, '');
+}
+
+async function generateProjectQuotePdf({ project, client, quote, layout }) {
+  const pdfDoc = await PDFDocument.create();
+  const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const cl = layout.cutlist;
+  const s = layout.settings || DEFAULTS;
+  const cur = pdfSafeText(quote?.currency || s.currency || '$');
+  const fmtMoney = (v) => `${cur}${Number(v || 0).toFixed(2)}`;
+  const quoteNum = quote?.quote_number || 'PRE-0001';
+  const dateStr = new Date(quote?.created_at || Date.now()).toLocaleDateString('es-ES');
+  const cNameMeta = client?.name || 'Cliente General / Consumidor Final';
+  const cTaxMeta = client?.tax_id || 'Sin especificar';
+
+  pdfDoc.setTitle(pdfSafeText(`DAJUSCA.APP - COTIZACION FORMAL ${quoteNum} - ${project.name}`));
+  pdfDoc.setAuthor(pdfSafeText(`Dajusca.app - Cliente: ${cNameMeta} (${cTaxMeta})`));
+  pdfDoc.setSubject(
+    pdfSafeText(
+      `DAJUSCA.APP | MADERA LOCAL | COTIZACION FORMAL ${quoteNum} | DATOS DEL CLIENTE: ${cNameMeta} ${cTaxMeta} ${client?.email || ''} | RESUMEN COMERCIAL: Subtotal Paneles ${fmtMoney(cl.panelsTotal)}, Subtotal Herrajes ${fmtMoney(cl.hardwareTotal)}, TOTAL PRESUPUESTO ${fmtMoney(cl.total)} | LISTA DE CORTES: ${cl.rows.map((r) => `${r.id} ${r.name} ${r.length}x${r.width}x${r.thickness}mm x${r.qty}`).join(', ')}`
+    )
+  );
+  pdfDoc.setKeywords([
+    pdfSafeText('DAJUSCA.APP'),
+    pdfSafeText('MADERA LOCAL'),
+    pdfSafeText('COTIZACION FORMAL'),
+    pdfSafeText(quoteNum),
+    pdfSafeText(cNameMeta),
+    pdfSafeText(cTaxMeta),
+    pdfSafeText('RESUMEN COMERCIAL'),
+    pdfSafeText('LISTA DE CORTES'),
+    ...cl.rows.map((r) => pdfSafeText(`${r.id} ${r.name}`)),
+  ]);
+  const summaryString = pdfSafeText(
+    `DAJUSCA.APP | MADERA LOCAL | COTIZACION FORMAL ${quoteNum} | DATOS DEL CLIENTE: ${cNameMeta} | RUT/DNI: ${cTaxMeta} | Email: ${client?.email || ''} | Tel: ${client?.phone || ''} | Direccion: ${client?.address || ''} | PROYECTO: ${project.name} (${layout.totalW}x${layout.maxH || s.height}x${s.depth} mm) | RESUMEN COMERCIAL: Subtotal Paneles ${fmtMoney(cl.panelsTotal)}, Subtotal Herrajes ${fmtMoney(cl.hardwareTotal)}, TOTAL PRESUPUESTO ${fmtMoney(cl.total)} | LISTA DE CORTES: ${cl.rows.map((r) => `${r.id} ${r.name} (${r.role}) ${r.length}x${r.width}x${r.thickness}mm x${r.qty} = ${fmtMoney(r.total)}`).join('; ')}`
+  );
+  pdfDoc.catalog.set(PDFName.of('MaderaQuoteInfo'), PDFString.of(summaryString));
+
+  const PAGE_W = 595.28;
+  const PAGE_H = 841.89;
+  const MARGIN = 36;
+  const CONTENT_W = PAGE_W - MARGIN * 2;
+
+  const colDark = rgb(0.11, 0.10, 0.098);
+  const colGold = rgb(1.0, 0.72, 0.0);
+  const colMuted = rgb(0.42, 0.40, 0.38);
+  const colLightBg = rgb(0.965, 0.96, 0.95);
+  const colBorder = rgb(0.84, 0.82, 0.80);
+  const colWhite = rgb(1, 1, 1);
+
+  let page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+  let y = PAGE_H - MARGIN;
+
+  const drawText = (text, x, yPos, { font = fontReg, size = 9, color = colDark } = {}) => {
+    page.drawText(pdfSafeText(text), { x, y: yPos, font, size, color });
+  };
+
+  const ensureSpace = (neededHeight) => {
+    if (y - neededHeight < MARGIN + 28) {
+      page = pdfDoc.addPage([PAGE_W, PAGE_H]);
+      y = PAGE_H - MARGIN;
+      // Compact continuation header
+      page.drawRectangle({ x: MARGIN, y: y - 24, width: CONTENT_W, height: 24, color: colDark });
+      drawText(`DAJUSCA.APP - Cotización ${quoteNum} (${project.name})`, MARGIN + 10, y - 16, {
+        font: fontBold,
+        size: 9,
+        color: colGold,
+      });
+      y -= 36;
+    }
+  };
+
+  // 1. MEMBRETE (Letterhead)
+  const headerH = 68;
+  page.drawRectangle({ x: MARGIN, y: y - headerH, width: CONTENT_W, height: headerH, color: colDark });
+  page.drawRectangle({ x: MARGIN, y: y - headerH, width: 6, height: headerH, color: colGold });
+
+  drawText('DAJUSCA.APP', MARGIN + 18, y - 24, { font: fontBold, size: 17, color: colGold });
+  drawText('Dajusca - Carpintería & Diseño de Mobiliario Modular', MARGIN + 18, y - 39, {
+    font: fontReg,
+    size: 9,
+    color: colWhite,
+  });
+  drawText('Dajusca | contacto@dajusca.app | Diseño, Despiece y Cotización', MARGIN + 18, y - 53, {
+    font: fontReg,
+    size: 8,
+    color: rgb(0.8, 0.78, 0.75),
+  });
+
+  drawText('COTIZACIÓN FORMAL', PAGE_W - MARGIN - 150, y - 22, { font: fontBold, size: 11, color: colWhite });
+  drawText(`N°: ${quoteNum}`, PAGE_W - MARGIN - 150, y - 38, { font: fontBold, size: 12, color: colGold });
+  drawText(`Fecha: ${dateStr}`, PAGE_W - MARGIN - 150, y - 53, { font: fontReg, size: 8.5, color: colWhite });
+
+  y -= headerH + 14;
+
+  // 2. DATOS DEL CLIENTE Y PROYECTO
+  const boxH = 84;
+  const colW = (CONTENT_W - 12) / 2;
+
+  // Client Box
+  page.drawRectangle({
+    x: MARGIN,
+    y: y - boxH,
+    width: colW,
+    height: boxH,
+    color: colLightBg,
+    borderColor: colBorder,
+    borderWidth: 1,
+  });
+  drawText('DATOS DEL CLIENTE', MARGIN + 10, y - 15, { font: fontBold, size: 9, color: colDark });
+  const cName = client?.name || 'Cliente General / Consumidor Final';
+  const cTax = client?.tax_id || 'Sin especificar';
+  const cEmail = client?.email || 'Sin correo registrado';
+  const cPhone = client?.phone || 'Sin teléfono';
+  const cAddr = client?.address || 'Retiro en taller / A convenir';
+
+  drawText(`Cliente: ${cName}`, MARGIN + 10, y - 30, { font: fontBold, size: 8.5 });
+  drawText(`RUT / DNI / NIF: ${cTax}`, MARGIN + 10, y - 43, { size: 8, color: colMuted });
+  drawText(`Email: ${cEmail} | Tel: ${cPhone}`, MARGIN + 10, y - 56, { size: 8, color: colMuted });
+  drawText(`Dirección: ${cAddr}`, MARGIN + 10, y - 69, { size: 8, color: colMuted });
+
+  // Project Box
+  const rightX = MARGIN + colW + 12;
+  page.drawRectangle({
+    x: rightX,
+    y: y - boxH,
+    width: colW,
+    height: boxH,
+    color: colLightBg,
+    borderColor: colBorder,
+    borderWidth: 1,
+  });
+  drawText('ESPECIFICACIONES DEL PROYECTO', rightX + 10, y - 15, { font: fontBold, size: 9, color: colDark });
+  const maxH = layout.maxH || s.height;
+  drawText(`Proyecto: ${project.name || 'Mueble modular'}`, rightX + 10, y - 30, { font: fontBold, size: 8.5 });
+  drawText(`Dimensiones: ${layout.totalW} x ${maxH} x ${s.depth} mm`, rightX + 10, y - 43, { size: 8, color: colMuted });
+  drawText(`Espesor tablero: ${s.thickness} mm | Fondo: ${s.backThickness} mm`, rightX + 10, y - 56, { size: 8, color: colMuted });
+  drawText(`Superficie paneles: ${cl.area.toFixed(2)} m2 | Piezas: ${cl.rows.reduce((a, r) => a + r.qty, 0)}`, rightX + 10, y - 69, {
+    size: 8,
+    color: colMuted,
+  });
+
+  y -= boxH + 14;
+
+  // 3. RESUMEN COMERCIAL (Commercial Summary)
+  const sumH = 74;
+  page.drawRectangle({
+    x: MARGIN,
+    y: y - sumH,
+    width: CONTENT_W,
+    height: sumH,
+    color: colWhite,
+    borderColor: colDark,
+    borderWidth: 1,
+  });
+  page.drawRectangle({ x: MARGIN, y: y - 20, width: CONTENT_W, height: 20, color: colDark });
+  drawText('RESUMEN COMERCIAL DEL PRESUPUESTO', MARGIN + 10, y - 14, {
+    font: fontBold,
+    size: 9,
+    color: colGold,
+  });
+
+  drawText(`Subtotal Paneles y Tableros (${cl.area.toFixed(2)} m2):`, MARGIN + 12, y - 36, { size: 9 });
+  drawText(fmtMoney(cl.panelsTotal), MARGIN + 240, y - 36, { font: fontBold, size: 9 });
+
+  drawText('Subtotal Herrajes y Accesorios:', MARGIN + 12, y - 51, { size: 9 });
+  drawText(fmtMoney(cl.hardwareTotal), MARGIN + 240, y - 51, { font: fontBold, size: 9 });
+
+  const finalTotal = quote?.total !== undefined && quote?.total > 0 ? quote.total : cl.total;
+  page.drawRectangle({
+    x: PAGE_W - MARGIN - 205,
+    y: y - sumH + 10,
+    width: 195,
+    height: 42,
+    color: colLightBg,
+    borderColor: colGold,
+    borderWidth: 1.5,
+  });
+  drawText('TOTAL PRESUPUESTO', PAGE_W - MARGIN - 195, y - 37, { font: fontBold, size: 8.5, color: colMuted });
+  drawText(fmtMoney(finalTotal), PAGE_W - MARGIN - 195, y - 54, { font: fontBold, size: 13, color: colDark });
+
+  y -= sumH + 16;
+
+  // 4. LISTA DE CORTES (Cutlist Table)
+  ensureSpace(60);
+  drawText('LISTA DE CORTES (DESGLOSE DE PANELES)', MARGIN, y - 10, { font: fontBold, size: 10, color: colDark });
+  y -= 16;
+
+  const drawCutlistHeader = () => {
+    page.drawRectangle({ x: MARGIN, y: y - 18, width: CONTENT_W, height: 18, color: colDark });
+    drawText('ID', MARGIN + 6, y - 12, { font: fontBold, size: 8, color: colGold });
+    drawText('Pieza / Rol', MARGIN + 36, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Orient.', MARGIN + 195, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Largo', MARGIN + 255, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Ancho', MARGIN + 305, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Esp.', MARGIN + 355, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Cant.', MARGIN + 390, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('P. Unit.', MARGIN + 425, y - 12, { font: fontBold, size: 8, color: colWhite });
+    drawText('Subtotal', MARGIN + 475, y - 12, { font: fontBold, size: 8, color: colWhite });
+    y -= 18;
+  };
+
+  drawCutlistHeader();
+
+  cl.rows.forEach((r, idx) => {
+    if (y - 16 < MARGIN + 28) {
+      ensureSpace(45);
+      drawCutlistHeader();
+    }
+    if (idx % 2 === 1) {
+      page.drawRectangle({ x: MARGIN, y: y - 15, width: CONTENT_W, height: 15, color: colLightBg });
+    }
+    const pieceLabel = `${r.name} (${r.role})`.slice(0, 32);
+    drawText(r.id, MARGIN + 6, y - 11, { font: fontBold, size: 8 });
+    drawText(pieceLabel, MARGIN + 36, y - 11, { size: 8 });
+    drawText(String(r.orientation || ''), MARGIN + 195, y - 11, { size: 7.5, color: colMuted });
+    drawText(`${r.length} mm`, MARGIN + 255, y - 11, { size: 8 });
+    drawText(`${r.width} mm`, MARGIN + 305, y - 11, { size: 8 });
+    drawText(`${r.thickness}`, MARGIN + 355, y - 11, { size: 8 });
+    drawText(String(r.qty), MARGIN + 395, y - 11, { font: fontBold, size: 8 });
+    drawText(fmtMoney(r.unitPrice), MARGIN + 425, y - 11, { size: 8 });
+    drawText(fmtMoney(r.total), MARGIN + 475, y - 11, { font: fontBold, size: 8 });
+    y -= 15;
+  });
+
+  // Cutlist Subtotal Row
+  page.drawRectangle({ x: MARGIN, y: y - 17, width: CONTENT_W, height: 17, color: colLightBg, borderColor: colBorder, borderWidth: 0.5 });
+  drawText(`Subtotal Paneles (${cl.area.toFixed(2)} m2)`, MARGIN + 6, y - 12, { font: fontBold, size: 8.5 });
+  drawText(fmtMoney(cl.panelsTotal), MARGIN + 475, y - 12, { font: fontBold, size: 8.5 });
+  y -= 28;
+
+  // 5. DESGLOSE DE HERRAJES (Hardware Table)
+  ensureSpace(60);
+  drawText('DESGLOSE DE HERRAJES Y ACCESORIOS', MARGIN, y - 10, { font: fontBold, size: 10, color: colDark });
+  y -= 16;
+
+  page.drawRectangle({ x: MARGIN, y: y - 18, width: CONTENT_W, height: 18, color: colDark });
+  drawText('Herraje / Especificación', MARGIN + 8, y - 12, { font: fontBold, size: 8, color: colWhite });
+  drawText('Cantidad', MARGIN + 340, y - 12, { font: fontBold, size: 8, color: colWhite });
+  drawText('P. Unit.', MARGIN + 410, y - 12, { font: fontBold, size: 8, color: colWhite });
+  drawText('Subtotal', MARGIN + 475, y - 12, { font: fontBold, size: 8, color: colWhite });
+  y -= 18;
+
+  if (cl.hardware && cl.hardware.length > 0) {
+    cl.hardware.forEach((h, idx) => {
+      ensureSpace(20);
+      if (idx % 2 === 1) {
+        page.drawRectangle({ x: MARGIN, y: y - 15, width: CONTENT_W, height: 15, color: colLightBg });
+      }
+      drawText(h.name, MARGIN + 8, y - 11, { size: 8 });
+      drawText(String(h.qty), MARGIN + 345, y - 11, { font: fontBold, size: 8 });
+      drawText(fmtMoney(h.unitPrice), MARGIN + 410, y - 11, { size: 8 });
+      drawText(fmtMoney(h.total), MARGIN + 475, y - 11, { font: fontBold, size: 8 });
+      y -= 15;
+    });
+  } else {
+    drawText('Sin herrajes adicionales', MARGIN + 8, y - 12, { size: 8, color: colMuted });
+    y -= 16;
+  }
+
+  page.drawRectangle({ x: MARGIN, y: y - 17, width: CONTENT_W, height: 17, color: colLightBg, borderColor: colBorder, borderWidth: 0.5 });
+  drawText('Subtotal Herrajes', MARGIN + 8, y - 12, { font: fontBold, size: 8.5 });
+  drawText(fmtMoney(cl.hardwareTotal), MARGIN + 475, y - 12, { font: fontBold, size: 8.5 });
+  y -= 28;
+
+  // Footer on all pages
+  const pages = pdfDoc.getPages();
+  pages.forEach((pg, i) => {
+    pg.drawText(
+      pdfSafeText(`Dajusca.app | Cotización ${quoteNum} | Proyecto: ${project.name} | Página ${i + 1} de ${pages.length}`),
+      { x: MARGIN, y: 18, font: fontReg, size: 7.5, color: colMuted }
+    );
+  });
+
+  return pdfDoc.save({ useObjectStreams: false });
+}
+
+const handleProjectPdf = async (req, res) => {
+  try {
+    const p = own(req);
+    if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+
+    const reqClientId = req.query.client_id ?? req.body?.client_id ?? p.client_id;
+    let client = reqClientId ? ownClient(req.user.id, reqClientId) : null;
+    if (!client && (req.body?.client || req.query.client_name)) {
+      client = {
+        name: req.body?.client?.name || req.query.client_name,
+        tax_id: req.body?.client?.tax_id || req.query.client_tax_id || '',
+        email: req.body?.client?.email || req.query.client_email || '',
+        phone: req.body?.client?.phone || req.query.client_phone || '',
+        address: req.body?.client?.address || req.query.client_address || '',
+      };
+    }
+
+    const pData = JSON.parse(p.data || '{}');
+    const layout = computeLayout(pData);
+
+    // Retrieve existing quote or create a correlative quote for this project
+    let quote = null;
+    const reqQuoteId = req.query.quote_id ?? req.body?.quote_id;
+    if (reqQuoteId) {
+      quote = db
+        .prepare('SELECT * FROM quotes WHERE id = ? AND user_id = ?')
+        .get(Number(reqQuoteId), req.user.id);
+    }
+    if (!quote && req.query.new_quote !== '1' && !req.body?.new_quote) {
+      quote = db
+        .prepare('SELECT * FROM quotes WHERE project_id = ? AND user_id = ? ORDER BY seq DESC, id DESC LIMIT 1')
+        .get(p.id, req.user.id);
+    }
+    if (!quote) {
+      quote = createQuoteRecord(req.user.id, {
+        project_id: p.id,
+        client_id: client?.id || p.client_id || null,
+        notes: req.body?.notes || '',
+      });
+    }
+
+    const pdfBytes = await generateProjectQuotePdf({ project: p, client, quote, layout });
+    const safeName = String(p.name || 'proyecto')
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]+/g, '_');
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="cotizacion-${quote.quote_number}-${safeName}.pdf"`
+    );
+    res.setHeader('X-Quote-Number', quote.quote_number);
+    res.send(Buffer.from(pdfBytes));
+  } catch (err) {
+    console.error('[PDF Export Error]:', err);
+    res.status(500).json({ error: 'Error al generar el PDF de cotización: ' + (err.message || err) });
+  }
+};
+
+app.get('/api/projects/:id/pdf', auth, handleProjectPdf);
+app.post('/api/projects/:id/pdf', auth, handleProjectPdf);
+
 // Export app and components for testing
-export { app, db, hashPassword, startSession, auth, migrateDb, upsertGoogleUser };
+export { app, db, hashPassword, startSession, auth, migrateDb, upsertGoogleUser, formatQuoteNumber, createQuoteRecord };
 
 // Start listening if executed directly
 if (process.argv[1] && (process.argv[1].endsWith('server.js') || process.argv[1].endsWith('server'))) {
-  app.listen(PORT, () => console.log(`Madera local en http://localhost:${PORT}`));
+  app.listen(PORT, '0.0.0.0', () => console.log(`Madera local en http://localhost:${PORT}`));
 }

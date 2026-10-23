@@ -6,11 +6,14 @@
   "description": "Réplica local de un diseñador 2D/3D de muebles modulares con módulos anidados y cutlist con precios",
   "scripts": {
     "start": "node server/server.js",
-    "dev": "node --watch server/server.js",
+    "dev": "node server/server.js",
+    "build": "node --check server/server.js && node --check public/js/layout.js && node --check public/js/viewer.js && node --check public/js/app.js && node --check public/js/model.js",
+    "lint": "node --check server/server.js && node --check public/js/layout.js && node --check public/js/viewer.js && node --check public/js/app.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "three": "^0.170.0"
+    "express": "^5.3.0",
+    "pdf-lib": "^1.17.1",
+    "three": "^0.186.1"
   }
 }

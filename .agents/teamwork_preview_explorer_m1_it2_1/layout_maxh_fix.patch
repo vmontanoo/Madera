@@ -1,0 +1,10 @@
+diff --git a/public/js/layout.js b/public/js/layout.js
+index c870634..e69de29 100644
+--- a/public/js/layout.js
++++ b/public/js/layout.js
+@@ -129,4 +129,4 @@ export function computeLayout(project) {
+   const cols = project.columns;
+   const colHeights = cols.map((c) => getColumnHeight(c, s));
+-  const maxH = Math.max(...colHeights, s.height);
++  const maxH = colHeights.length > 0 ? Math.max(...colHeights) : s.height;
+   const D = s.depth;
